@@ -15,14 +15,31 @@ model:
 train:
   device: "cuda"
   seed: 42
-  epochs: 300
+  epochs: 200
   batch_size: 256
   num_workers: 0
   lr: 0.001
-  output_dir: "D:/code/AU+landmark/dataset/motor_regression_baseline/runs/baseline_mlp_24_64_64_30"
+  output_dir: "D:/code/AU+landmark/dataset/motor_regression_baseline"
+  # 是否将每次训练写入独立子目录（run_001/run_002/...）
+  use_run_subdir: true
+  # run 子目录前缀
+  run_prefix: "run_"
+  # run 编号位数，3 => run_001
+  run_digits: 3
+  # 手动指定 run 名称；留空则自动分配下一个编号
+  run_name: ""
+  # run_name 已存在时是否允许覆盖写入
+  allow_existing_run: false
   early_stopping:
     patience: 30
     min_delta: 1.0e-6
+
+# 验证/测试 checkpoint 选择配置
+eval:
+  # 可填 latest 或具体 run 名称（如 run_003）
+  run_name: "latest"
+  # 评估时使用的权重文件名
+  ckpt_file: "best.pt"
 
 # Metric configuration
 metrics:
@@ -32,6 +49,9 @@ metrics:
   # Valid normalized output range for out-of-range ratio
   out_range_lo: 0.0
   out_range_hi: 1.0
+
+  # Top-K motors shown in out-of-range ranking
+  out_of_range_top_k: 10
 
   # 30-dim motor -> 4-region mapping
   # brow: 0-3
@@ -43,3 +63,61 @@ metrics:
     eye: [4, 5, 6, 7, 8, 9]
     jaw: [10, 11, 12, 13, 14, 27, 28]
     mouth: [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29]
+
+  # Motor names used in ranking outputs
+  motor_names:
+    - "Brow Inner Left"
+    - "Brow Inner Right"
+    - "Brow Outer Left"
+    - "Brow Outer Right"
+    - "Eyelid Lower Left"
+    - "Eyelid Lower Right"
+    - "Eyelid Upper Left"
+    - "Eyelid Upper Right"
+    - "Gaze Target Phi"
+    - "Gaze Target Theta"
+    - "Head Pitch"
+    - "Head Roll"
+    - "Head Yaw"
+    - "Jaw Pitch"
+    - "Jaw Yaw"
+    - "Lip Bottom Curl"
+    - "Lip Bottom Depress Left"
+    - "Lip Bottom Depress Middle"
+    - "Lip Bottom Depress Right"
+    - "Lip Corner Raise Left"
+    - "Lip Corner Raise Right"
+    - "Lip Corner Stretch Left"
+    - "Lip Corner Stretch Right"
+    - "Lip Top Curl"
+    - "Lip Top Raise Left"
+    - "Lip Top Raise Middle"
+    - "Lip Top Raise Right"
+    - "Neck Pitch"
+    - "Neck Roll"
+    - "Nose Wrinkle"
+
+  # Error-context analysis: relation between sample error and expression/pose factors
+  error_context:
+    enabled: true
+    bins: 10
+    rel_file: "D:/code/AU+landmark/dataset/x2c_data_bundle/REL_input_vec_X2C_gpu.csv.gz"
+    abs_file: "D:/code/AU+landmark/dataset/x2c_data_bundle/ABS_input_vec_X2C_gpu.csv.gz"
+
+# Explainability & structure-consistency analysis (run by explainability.py)
+explainability:
+  split: "test"
+
+  # latent24 区域划分
+  # brow: 0-3, eye: 4-7, mouth: 8-17, jaw: 18-21, global: 22-23
+  latent_region_indices:
+    brow: [0, 1, 2, 3]
+    eye: [4, 5, 6, 7]
+    mouth: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+    jaw: [18, 19, 20, 21]
+    global: [22, 23]
+
+  perturbation:
+    noise_std_scale: 1.0
+    random_seed: 42
+    top_k: 10

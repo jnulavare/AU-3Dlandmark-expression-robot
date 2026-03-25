@@ -15,16 +15,15 @@ from torch.utils.data import DataLoader
 
 from data_utils import XYDataset, build_xy_from_split, load_latent24_map, load_target30_map
 from model import MotorRegressorMLP
+from run_utils import resolve_train_output_dir
 
 
-# 读取命令行参数（主要是配置文件路径）
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train baseline latent24->motor30 regressor.")
     p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
     return p.parse_args()
 
 
-# 固定随机种子，保证训练可复现
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -32,14 +31,12 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# 根据配置自动选择 GPU/CPU
 def resolve_device(device_cfg: str) -> torch.device:
     if device_cfg.startswith("cuda") and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
 
-# 验证阶段：计算整体 MAE（30维先逐样本取均值）
 def evaluate_mae(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
     mae_sum = 0.0
@@ -56,36 +53,33 @@ def evaluate_mae(model: torch.nn.Module, loader: DataLoader, device: torch.devic
 
 
 def main() -> None:
-    # 读取训练配置
     args = parse_args()
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
     seed = int(cfg["train"]["seed"])
     set_seed(seed)
 
-    # 准备设备与输出目录
     device = resolve_device(str(cfg["train"]["device"]))
-    output_dir = Path(cfg["train"]["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir, run_name = resolve_train_output_dir(cfg["train"])
 
     latent_file = Path(cfg["data"]["latent_file"])
     target_file = Path(cfg["data"]["target_file"])
     train_split = Path(cfg["data"]["train_split"])
     val_split = Path(cfg["data"]["val_split"])
 
-    # 加载 latent24 与归一化后的 motor30 标签
     print(f"[INFO] device={device}")
+    if run_name is not None:
+        print(f"[INFO] run_name={run_name}")
+    print(f"[INFO] output_dir={output_dir}")
     print("[INFO] loading latent/target maps...")
     latent_map = load_latent24_map(latent_file)
     target_map = load_target30_map(target_file)
 
-    # 根据 split 构建训练/验证数据
     print("[INFO] building train/val arrays...")
     x_train, y_train = build_xy_from_split(train_split, latent_map, target_map)
     x_val, y_val = build_xy_from_split(val_split, latent_map, target_map)
     print(f"[INFO] train={x_train.shape} val={x_val.shape}")
 
-    # DataLoader（支持 GPU pin_memory）
     train_ds = XYDataset(x_train, y_train)
     val_ds = XYDataset(x_val, y_val)
 
@@ -106,7 +100,6 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # 构建基线模型与优化器
     model = MotorRegressorMLP(
         input_dim=int(cfg["model"]["input_dim"]),
         hidden1=int(cfg["model"]["hidden_dim1"]),
@@ -117,7 +110,6 @@ def main() -> None:
     criterion = torch.nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg["train"]["lr"]))
 
-    # 训练配置与 early stopping 参数
     epochs = int(cfg["train"]["epochs"])
     patience = int(cfg["train"]["early_stopping"]["patience"])
     min_delta = float(cfg["train"]["early_stopping"]["min_delta"])
@@ -129,7 +121,6 @@ def main() -> None:
     best_ckpt = output_dir / "best.pt"
     last_ckpt = output_dir / "last.pt"
 
-    # 训练主循环：train L1 + val MAE
     with history_path.open("w", encoding="utf-8", newline="") as f_hist:
         writer = csv.writer(f_hist)
         writer.writerow(["epoch", "train_loss_l1", "val_mae"])
@@ -139,7 +130,6 @@ def main() -> None:
             model.train()
             loss_sum = 0.0
             n = 0
-            # 单轮训练
             for x, y in train_loader:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
@@ -154,13 +144,11 @@ def main() -> None:
                 loss_sum += float(loss.item()) * bs
                 n += bs
 
-            # 单轮验证
             train_loss = loss_sum / max(n, 1)
             val_mae = evaluate_mae(model, val_loader, device)
             writer.writerow([epoch, train_loss, val_mae])
             f_hist.flush()
 
-            # 保存最佳模型（按 val MAE）
             improved = val_mae < (best_val - min_delta)
             if improved:
                 best_val = val_mae
@@ -180,14 +168,12 @@ def main() -> None:
 
             print(f"[EPOCH {epoch:03d}] train_l1={train_loss:.6f} val_mae={val_mae:.6f} best={best_val:.6f}")
 
-            # 触发提前停止
             if bad_epochs >= patience:
                 print(f"[INFO] early stopping at epoch={epoch}, best_epoch={best_epoch}")
                 break
 
         elapsed = time.time() - t0
 
-    # 保存最后一轮模型（无论是否最佳）
     torch.save(
         {
             "epoch": epoch,
@@ -198,7 +184,6 @@ def main() -> None:
         last_ckpt,
     )
 
-    # 输出训练摘要
     summary = {
         "best_val_mae": best_val,
         "best_epoch": best_epoch,
@@ -206,6 +191,8 @@ def main() -> None:
         "device": str(device),
         "train_samples": int(x_train.shape[0]),
         "val_samples": int(x_val.shape[0]),
+        "run_name": run_name,
+        "output_dir": str(output_dir),
         "paths": {
             "best_ckpt": str(best_ckpt),
             "last_ckpt": str(last_ckpt),
