@@ -394,6 +394,95 @@ def analyze_error_vs_context(
     }
 
 
+def compute_pose_slice_mae_analysis(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    yaw: np.ndarray,
+    pitch: np.ndarray,
+    roll: np.ndarray,
+    region_indices: Mapping[str, Iterable[int]],
+    motor_names: List[str],
+    frontal_max_deg: float = 10.0,
+    moderate_max_deg: float = 25.0,
+) -> Dict[str, object]:
+    """按姿态切片统计 MAE（overall / per-region / per-motor）。"""
+    if y_true.shape != y_pred.shape:
+        raise RuntimeError(f"shape mismatch: y_true={y_true.shape}, y_pred={y_pred.shape}")
+    if y_true.ndim != 2:
+        raise RuntimeError(f"expect 2D arrays, got y_true.ndim={y_true.ndim}")
+    if moderate_max_deg <= frontal_max_deg:
+        raise RuntimeError(
+            f"invalid pose slice thresholds: frontal_max_deg={frontal_max_deg}, moderate_max_deg={moderate_max_deg}"
+        )
+
+    n, d = y_true.shape
+    if len(motor_names) < d:
+        motor_names = motor_names + [f"motor_{i:02d}" for i in range(len(motor_names), d)]
+    motor_names = motor_names[:d]
+
+    yaw = np.asarray(yaw, dtype=np.float64)
+    pitch = np.asarray(pitch, dtype=np.float64)
+    roll = np.asarray(roll, dtype=np.float64)
+    if yaw.shape[0] != n or pitch.shape[0] != n or roll.shape[0] != n:
+        raise RuntimeError(
+            f"pose array size mismatch: y={n}, yaw={yaw.shape[0]}, pitch={pitch.shape[0]}, roll={roll.shape[0]}"
+        )
+
+    valid_pose = np.isfinite(yaw) & np.isfinite(pitch) & np.isfinite(roll)
+    pose_strength = np.maximum(np.abs(yaw), np.maximum(np.abs(pitch), np.abs(roll)))
+    abs_err = np.abs(y_pred - y_true)
+
+    slice_masks = {
+        "frontal": valid_pose & (pose_strength <= frontal_max_deg),
+        "moderate_pose": valid_pose & (pose_strength > frontal_max_deg) & (pose_strength <= moderate_max_deg),
+        "extreme_pose": valid_pose & (pose_strength > moderate_max_deg),
+    }
+
+    out_slices: Dict[str, object] = {}
+    for slice_name, mask in slice_masks.items():
+        count = int(np.sum(mask))
+        slice_obj: Dict[str, object] = {
+            "samples": count,
+            "sample_ratio": float(count / max(n, 1)),
+            "overall_mae": None,
+            "per_region_mae": {},
+            "per_motor_mae": [],
+        }
+        if count == 0:
+            out_slices[slice_name] = slice_obj
+            continue
+
+        s_abs_err = abs_err[mask]
+        mae_per_motor = np.mean(s_abs_err, axis=0)
+        slice_obj["overall_mae"] = float(np.mean(mae_per_motor))
+        slice_obj["per_motor_mae"] = [
+            {"motor_idx": int(i), "motor_name": motor_names[i], "mae": float(mae_per_motor[i])}
+            for i in range(d)
+        ]
+
+        region_mae: Dict[str, float] = {}
+        for region_name, idxs in region_indices.items():
+            idx_arr = np.asarray(list(idxs), dtype=np.int64)
+            if idx_arr.size == 0:
+                continue
+            region_mae[str(region_name)] = float(np.mean(s_abs_err[:, idx_arr]))
+        slice_obj["per_region_mae"] = region_mae
+        out_slices[slice_name] = slice_obj
+
+    return {
+        "enabled": True,
+        "thresholds_deg": {
+            "frontal_max_deg": float(frontal_max_deg),
+            "moderate_max_deg": float(moderate_max_deg),
+        },
+        "pose_strength_definition": "max(abs(yaw), abs(pitch), abs(roll))",
+        "valid_pose_samples": int(np.sum(valid_pose)),
+        "total_samples": int(n),
+        "valid_pose_ratio": float(np.sum(valid_pose) / max(n, 1)),
+        "slices": out_slices,
+    }
+
+
 def compute_regression_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,

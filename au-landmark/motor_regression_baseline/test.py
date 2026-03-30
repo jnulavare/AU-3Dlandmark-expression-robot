@@ -16,6 +16,7 @@ from eval_metrics import (
     clip_predictions_to_range,
     collect_predictions,
     compute_boundary_violation_metrics,
+    compute_pose_slice_mae_analysis,
     compute_regression_metrics,
     load_context_feature_arrays,
     load_motor_names,
@@ -128,7 +129,10 @@ def main() -> None:
     }
 
     context_cfg = metrics_cfg.get("error_context", {})
-    if bool(context_cfg.get("enabled", True)):
+    pose_slice_cfg = metrics_cfg.get("pose_slice", {})
+    need_pose_context = bool(context_cfg.get("enabled", True)) or bool(pose_slice_cfg.get("enabled", True))
+    context = None
+    if need_pose_context:
         split_indices = load_split_indices(split_path)
         if len(split_indices) != int(y_true.shape[0]):
             raise RuntimeError(
@@ -140,6 +144,10 @@ def main() -> None:
         abs_file = Path(context_cfg.get("abs_file", str(latent_parent / "ABS_input_vec_X2C_gpu.csv.gz")))
         context = load_context_feature_arrays(split_indices=split_indices, rel_file=rel_file, abs_file=abs_file)
 
+    if bool(context_cfg.get("enabled", True)):
+        if context is None:
+            raise RuntimeError("context should not be None when error_context is enabled")
+
         sample_mae = np.mean(np.abs(y_pred - y_true), axis=1)
         metric_dict["error_context_analysis"] = analyze_error_vs_context(
             sample_mae=sample_mae,
@@ -148,6 +156,23 @@ def main() -> None:
         )
     else:
         metric_dict["error_context_analysis"] = {"enabled": False}
+
+    if bool(pose_slice_cfg.get("enabled", True)):
+        if context is None:
+            raise RuntimeError("context should not be None when pose_slice is enabled")
+        metric_dict["pose_slice_mae_analysis"] = compute_pose_slice_mae_analysis(
+            y_true=y_true,
+            y_pred=y_pred,
+            yaw=np.asarray(context.get("yaw", np.array([])), dtype=np.float64),
+            pitch=np.asarray(context.get("pitch", np.array([])), dtype=np.float64),
+            roll=np.asarray(context.get("roll", np.array([])), dtype=np.float64),
+            region_indices=region_indices,
+            motor_names=motor_names,
+            frontal_max_deg=float(pose_slice_cfg.get("frontal_max_deg", 10.0)),
+            moderate_max_deg=float(pose_slice_cfg.get("moderate_max_deg", 25.0)),
+        )
+    else:
+        metric_dict["pose_slice_mae_analysis"] = {"enabled": False}
 
     metrics = {
         "split": "test",
@@ -171,6 +196,14 @@ def main() -> None:
         f"raw_oor={metrics['boundary_constraint']['raw_prediction_boundary']['ratio']:.6f} "
         f"samples={metrics['samples']}"
     )
+    if metrics["pose_slice_mae_analysis"].get("enabled", False):
+        slices = metrics["pose_slice_mae_analysis"]["slices"]
+        print(
+            "[POSE] "
+            f"frontal_mae={slices['frontal']['overall_mae']} "
+            f"moderate_mae={slices['moderate_pose']['overall_mae']} "
+            f"extreme_mae={slices['extreme_pose']['overall_mae']}"
+        )
     print(f"[DONE] ckpt={ckpt_path}")
     print(f"[DONE] metrics={out_json}")
 
