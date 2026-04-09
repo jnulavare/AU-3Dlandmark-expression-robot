@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Validation entry for regional ABS/REL/Pose -> z24 -> motor30 model."""
+
 from __future__ import annotations
 
 import argparse
@@ -10,7 +12,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from data_utils import XYDataset, build_xy_from_split, load_latent24_map, load_split_indices, load_target30_map
+from data_utils import RegionalInputDataset, build_region_inputs_from_split, load_split_indices, load_target30_map
 from eval_metrics import (
     analyze_error_vs_context,
     clip_predictions_to_range,
@@ -36,7 +38,7 @@ def _as_bool(v: object, default: bool) -> bool:
 
 
 def resolve_boundary_eval_cfg(cfg: dict) -> dict:
-    """解析验证/测试阶段的边界后处理配置。"""
+    # 验证阶段边界配置：用于可选 clip 预测值，避免越界值放大指标波动。
     metrics_cfg = cfg.get("metrics", {})
     boundary_cfg = cfg.get("boundary", {})
     lo = float(boundary_cfg.get("lo", metrics_cfg.get("out_range_lo", 0.0)))
@@ -51,7 +53,7 @@ def resolve_boundary_eval_cfg(cfg: dict) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Validate baseline regressor on val split.")
+    p = argparse.ArgumentParser(description="Validate regional-gated regressor on val split.")
     p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
     p.add_argument("--ckpt", type=Path, default=None, help="Override config.eval and use explicit checkpoint path")
     return p.parse_args()
@@ -63,6 +65,17 @@ def resolve_device(device_cfg: str) -> torch.device:
     return torch.device("cpu")
 
 
+def _context_data_root(data_cfg: dict) -> Path:
+    # 上下文特征文件默认与 ABS/REL 同目录，支持在 metrics.error_context 中覆盖。
+    if "abs_file" in data_cfg:
+        return Path(str(data_cfg["abs_file"])).parent
+    if "rel_file" in data_cfg:
+        return Path(str(data_cfg["rel_file"])).parent
+    if "latent_file" in data_cfg:
+        return Path(str(data_cfg["latent_file"])).parent
+    return Path(".")
+
+
 def main() -> None:
     args = parse_args()
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -72,12 +85,19 @@ def main() -> None:
 
     ckpt_path, output_dir, run_name = resolve_eval_ckpt_path(cfg, args.ckpt)
 
-    latent_map = load_latent24_map(Path(cfg["data"]["latent_file"]))
+    # 1) 按 val split 顺序构建输入，确保预测与标签逐样本对齐。
     target_map = load_target30_map(Path(cfg["data"]["target_file"]))
     split_path = Path(cfg["data"]["val_split"])
-    x_val, y_val = build_xy_from_split(split_path, latent_map, target_map)
+    feature385_file = Path(cfg["data"]["feature385_file"]) if "feature385_file" in cfg["data"] else None
+    x_val, y_val = build_region_inputs_from_split(
+        split_path,
+        abs_file=Path(cfg["data"]["abs_file"]),
+        rel_file=Path(cfg["data"]["rel_file"]),
+        target30_map=target_map,
+        feature385_file=feature385_file,
+    )
 
-    ds = XYDataset(x_val, y_val)
+    ds = RegionalInputDataset(x_val, y_val)
     loader = DataLoader(
         ds,
         batch_size=int(cfg["train"]["batch_size"]),
@@ -86,12 +106,8 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = MotorRegressorMLP(
-        input_dim=int(cfg["model"]["input_dim"]),
-        hidden1=int(cfg["model"]["hidden_dim1"]),
-        hidden2=int(cfg["model"]["hidden_dim2"]),
-        output_dim=int(cfg["model"]["output_dim"]),
-    ).to(device)
+    # 2) 加载 checkpoint 并做整集推理。
+    model = MotorRegressorMLP().to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -103,6 +119,7 @@ def main() -> None:
         y_pred = y_pred_raw
     region_indices = load_motor_region_indices(metrics_cfg=metrics_cfg, dim=y_true.shape[1])
     motor_names = load_motor_names(metrics_cfg=metrics_cfg, dim=y_true.shape[1])
+    # 3) 计算主指标；保持字段结构稳定，兼容下游分析脚本。
     metric_dict = compute_regression_metrics(
         y_true=y_true,
         y_pred=y_pred,
@@ -129,18 +146,20 @@ def main() -> None:
 
     context_cfg = metrics_cfg.get("error_context", {})
     if bool(context_cfg.get("enabled", True)):
+        # 误差-上下文分析依赖 split 索引，长度必须与评估样本数完全一致。
         split_indices = load_split_indices(split_path)
         if len(split_indices) != int(y_true.shape[0]):
             raise RuntimeError(
                 f"split size mismatch for context analysis: split={len(split_indices)} eval={y_true.shape[0]}"
             )
 
-        latent_parent = Path(cfg["data"]["latent_file"]).parent
-        rel_file = Path(context_cfg.get("rel_file", str(latent_parent / "REL_input_vec_X2C_gpu.csv.gz")))
-        abs_file = Path(context_cfg.get("abs_file", str(latent_parent / "ABS_input_vec_X2C_gpu.csv.gz")))
+        parent = _context_data_root(cfg["data"])
+        rel_file = Path(context_cfg.get("rel_file", str(parent / "REL_input_vec_X2C_gpu.csv.gz")))
+        abs_file = Path(context_cfg.get("abs_file", str(parent / "ABS_input_vec_X2C_gpu.csv.gz")))
         context = load_context_feature_arrays(split_indices=split_indices, rel_file=rel_file, abs_file=abs_file)
 
         sample_mae = np.mean(np.abs(y_pred - y_true), axis=1)
+        # 按分桶统计“姿态/能量等上下文”与误差的关联。
         metric_dict["error_context_analysis"] = analyze_error_vs_context(
             sample_mae=sample_mae,
             context=context,

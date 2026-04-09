@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Training entry for regional ABS/REL/Pose -> z24 -> motor30 model."""
+
 from __future__ import annotations
 
 import argparse
@@ -13,7 +15,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from data_utils import XYDataset, build_xy_from_split, load_latent24_map, load_target30_map
+from data_utils import RegionalInputDataset, build_region_inputs_from_split, load_target30_map
 from model import MotorRegressorMLP
 from run_utils import resolve_train_output_dir
 
@@ -29,7 +31,7 @@ def _as_bool(v: object, default: bool) -> bool:
 
 
 def resolve_boundary_train_cfg(cfg: dict) -> dict:
-    """解析边界约束训练配置。"""
+    # 训练阶段的边界配置优先级：boundary.train > boundary > metrics 默认值。
     metrics_cfg = cfg.get("metrics", {})
     boundary_cfg = cfg.get("boundary", {})
     train_boundary_cfg = boundary_cfg.get("train", {}) if isinstance(boundary_cfg, dict) else {}
@@ -48,12 +50,13 @@ def resolve_boundary_train_cfg(cfg: dict) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train baseline latent24->motor30 regressor.")
+    p = argparse.ArgumentParser(description="Train regional-gated ABS/REL/Pose -> z24 -> motor30 regressor.")
     p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
     return p.parse_args()
 
 
 def set_seed(seed: int) -> None:
+    # 固定随机种子，保证训练过程可复现（含 CUDA）。
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -66,8 +69,12 @@ def resolve_device(device_cfg: str) -> torch.device:
     return torch.device("cpu")
 
 
+def move_inputs_to_device(x: dict, device: torch.device) -> dict:
+    # 输入是“分区域特征字典”，需要把每个分支都搬到同一 device。
+    return {k: v.to(device, non_blocking=True) for k, v in x.items()}
+
+
 def compute_boundary_loss_torch(pred: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
-    """边界惩罚：超出上下界的幅度均值。"""
     return (torch.relu(lo - pred) + torch.relu(pred - hi)).mean()
 
 
@@ -79,19 +86,20 @@ def evaluate_mae(
     lo: float,
     hi: float,
 ) -> float:
+    # 统一验证口径：可选先 clip 再计算 MAE，与评估脚本保持一致。
     model.eval()
     mae_sum = 0.0
     n = 0
     with torch.inference_mode():
         for x, y in loader:
-            x = x.to(device, non_blocking=True)
+            x = move_inputs_to_device(x, device=device)
             y = y.to(device, non_blocking=True)
             pred = model(x)
             if clip_predictions:
                 pred = torch.clamp(pred, min=lo, max=hi)
             mae = torch.mean(torch.abs(pred - y), dim=1)
             mae_sum += float(mae.sum().item())
-            n += int(x.shape[0])
+            n += int(y.shape[0])
     return mae_sum / max(n, 1)
 
 
@@ -106,7 +114,9 @@ def main() -> None:
     device = resolve_device(str(cfg["train"]["device"]))
     output_dir, run_name = resolve_train_output_dir(cfg["train"])
 
-    latent_file = Path(cfg["data"]["latent_file"])
+    abs_file = Path(cfg["data"]["abs_file"])
+    rel_file = Path(cfg["data"]["rel_file"])
+    feature385_file = Path(cfg["data"]["feature385_file"]) if "feature385_file" in cfg["data"] else None
     target_file = Path(cfg["data"]["target_file"])
     train_split = Path(cfg["data"]["train_split"])
     val_split = Path(cfg["data"]["val_split"])
@@ -123,17 +133,36 @@ def main() -> None:
         f"boundary_loss={boundary_cfg['enable_boundary_loss']} "
         f"weight={boundary_cfg['boundary_loss_weight']}"
     )
-    print("[INFO] loading latent/target maps...")
-    latent_map = load_latent24_map(latent_file)
+    # 1) 读取 target30，并按 split 顺序构建输入，确保样本顺序一致。
+    print("[INFO] loading target map...")
     target_map = load_target30_map(target_file)
 
-    print("[INFO] building train/val arrays...")
-    x_train, y_train = build_xy_from_split(train_split, latent_map, target_map)
-    x_val, y_val = build_xy_from_split(val_split, latent_map, target_map)
-    print(f"[INFO] train={x_train.shape} val={x_val.shape}")
+    print("[INFO] building train/val arrays from ABS+REL+Pose...")
+    if feature385_file is not None and feature385_file.exists():
+        print(f"[INFO] using feature385_file={feature385_file}")
+    else:
+        print(f"[INFO] using abs_file={abs_file} rel_file={rel_file}")
+    x_train, y_train = build_region_inputs_from_split(
+        train_split,
+        abs_file=abs_file,
+        rel_file=rel_file,
+        target30_map=target_map,
+        feature385_file=feature385_file,
+    )
+    x_val, y_val = build_region_inputs_from_split(
+        val_split,
+        abs_file=abs_file,
+        rel_file=rel_file,
+        target30_map=target_map,
+        feature385_file=feature385_file,
+    )
+    print(
+        f"[INFO] train={y_train.shape} val={y_val.shape} "
+        f"feature385={sum(v.shape[1] for v in x_train.values())}"
+    )
 
-    train_ds = XYDataset(x_train, y_train)
-    val_ds = XYDataset(x_val, y_val)
+    train_ds = RegionalInputDataset(x_train, y_train)
+    val_ds = RegionalInputDataset(x_val, y_val)
 
     batch_size = int(cfg["train"]["batch_size"])
     num_workers = int(cfg["train"].get("num_workers", 0))
@@ -152,13 +181,8 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = MotorRegressorMLP(
-        input_dim=int(cfg["model"]["input_dim"]),
-        hidden1=int(cfg["model"]["hidden_dim1"]),
-        hidden2=int(cfg["model"]["hidden_dim2"]),
-        output_dim=int(cfg["model"]["output_dim"]),
-    ).to(device)
-
+    # 2) 初始化模型、损失函数与优化器。
+    model = MotorRegressorMLP().to(device)
     criterion = torch.nn.L1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg["train"]["lr"]))
 
@@ -178,6 +202,7 @@ def main() -> None:
         writer.writerow(["epoch", "train_loss_l1", "train_boundary_loss", "train_total_loss", "val_mae"])
 
         t0 = time.time()
+        # 3) 标准训练循环：任务损失 + 可选边界惩罚（限制输出越界）。
         for epoch in range(1, epochs + 1):
             model.train()
             task_loss_sum = 0.0
@@ -185,7 +210,7 @@ def main() -> None:
             total_loss_sum = 0.0
             n = 0
             for x, y in train_loader:
-                x = x.to(device, non_blocking=True)
+                x = move_inputs_to_device(x, device=device)
                 y = y.to(device, non_blocking=True)
                 raw_pred = model(x)
                 pred_for_task = (
@@ -193,6 +218,7 @@ def main() -> None:
                     if boundary_cfg["clamp_for_task_loss"]
                     else raw_pred
                 )
+                # 任务损失可用 clamp 后的预测；边界损失始终基于 raw_pred 计算越界量。
                 task_loss = criterion(pred_for_task, y)
                 boundary_loss = compute_boundary_loss_torch(raw_pred, lo=boundary_cfg["lo"], hi=boundary_cfg["hi"])
                 if boundary_cfg["enable_boundary_loss"]:
@@ -204,7 +230,7 @@ def main() -> None:
                 loss.backward()
                 optimizer.step()
 
-                bs = int(x.shape[0])
+                bs = int(y.shape[0])
                 task_loss_sum += float(task_loss.item()) * bs
                 boundary_loss_sum += float(boundary_loss.item()) * bs
                 total_loss_sum += float(loss.item()) * bs
@@ -225,6 +251,7 @@ def main() -> None:
             f_hist.flush()
 
             improved = val_mae < (best_val - min_delta)
+            # 4) 以验证集 MAE 作为早停与 best checkpoint 的判定标准。
             if improved:
                 best_val = val_mae
                 best_epoch = epoch
@@ -255,6 +282,7 @@ def main() -> None:
 
         elapsed = time.time() - t0
 
+    # 5) 无论是否早停，都保存最后一个 checkpoint，便于复现和排查。
     torch.save(
         {
             "epoch": epoch,
@@ -270,8 +298,9 @@ def main() -> None:
         "best_epoch": best_epoch,
         "elapsed_sec": elapsed,
         "device": str(device),
-        "train_samples": int(x_train.shape[0]),
-        "val_samples": int(x_val.shape[0]),
+        "train_samples": int(y_train.shape[0]),
+        "val_samples": int(y_val.shape[0]),
+        "feature_dim_total": int(sum(v.shape[1] for v in x_train.values())),
         "run_name": run_name,
         "output_dir": str(output_dir),
         "boundary_train_cfg": boundary_cfg,

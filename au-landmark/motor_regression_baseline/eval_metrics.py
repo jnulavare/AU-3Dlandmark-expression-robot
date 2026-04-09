@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Evaluation and error-analysis utilities.
+# Keep output metric keys stable for compatibility with existing reports/tools.
 """评估指标与误差剖析工具模块。"""
 
 # flake8: noqa: E501
@@ -170,7 +172,11 @@ def collect_predictions(
     model.eval()
     with torch.inference_mode():
         for x, y in loader:
-            x = x.to(device, non_blocking=True)
+            # Support both tensor input and dict-style regional input.
+            if isinstance(x, Mapping):
+                x = {k: v.to(device, non_blocking=True) for k, v in x.items()}
+            else:
+                x = x.to(device, non_blocking=True)
             pred = model(x)
             ys.append(y.detach().cpu().numpy())
             preds.append(pred.detach().cpu().numpy())

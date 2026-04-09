@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""latent->motor 可解释性与结构一致性分析脚本。"""
+"""Explainability entry for regional model.
+
+Outputs keep the original artifact names while latent now comes from model-internal z24.
+"""
 
 from __future__ import annotations
 
@@ -12,13 +15,12 @@ import numpy as np
 import torch
 import yaml
 
-from data_utils import build_xy_from_split, load_latent24_map, load_target30_map
+from data_utils import build_region_inputs_from_split, load_target30_map
 from eval_metrics import load_motor_names, load_motor_region_indices
 from model import MotorRegressorMLP
 from run_utils import resolve_eval_ckpt_path
 
 
-# latent24 的默认区域划分（基于 build_latent24_from_abs_rel.py 的拼接顺序）
 DEFAULT_LATENT_REGION_INDICES: Dict[str, List[int]] = {
     "brow": [0, 1, 2, 3],
     "eye": [4, 5, 6, 7],
@@ -29,8 +31,7 @@ DEFAULT_LATENT_REGION_INDICES: Dict[str, List[int]] = {
 
 
 def parse_args() -> argparse.Namespace:
-    """解析命令行参数。"""
-    p = argparse.ArgumentParser(description="Explainability & structure consistency analysis for latent24->motor30.")
+    p = argparse.ArgumentParser(description="Explainability analysis based on model z24 and motor30.")
     p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
     p.add_argument("--ckpt", type=Path, default=None, help="Override config.eval and use explicit checkpoint path")
     p.add_argument(
@@ -44,7 +45,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _to_index_list(v: object) -> List[int]:
-    """将对象校验并转换为 list[int]。"""
     if not isinstance(v, list):
         raise RuntimeError(f"expect list[int], got: {type(v)}")
     out: List[int] = []
@@ -56,7 +56,6 @@ def _to_index_list(v: object) -> List[int]:
 
 
 def load_latent_region_indices(explain_cfg: Mapping[str, object] | None, dim: int) -> Dict[str, List[int]]:
-    """读取 latent 区域索引配置并做合法性校验。"""
     region_cfg = None
     if isinstance(explain_cfg, Mapping):
         region_cfg = explain_cfg.get("latent_region_indices")
@@ -76,7 +75,6 @@ def load_latent_region_indices(explain_cfg: Mapping[str, object] | None, dim: in
 
 
 def _corr_matrix(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """计算 x(latent) 与 y(motor) 的皮尔逊相关矩阵 [x_dim, y_dim]。"""
     if x.ndim != 2 or y.ndim != 2:
         raise RuntimeError(f"corr input must be 2D, got x={x.ndim}, y={y.ndim}")
     if x.shape[0] != y.shape[0]:
@@ -97,7 +95,6 @@ def _corr_matrix(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 
 def _region_block_stats(corr: np.ndarray) -> Dict[str, float]:
-    """对某个相关矩阵子块计算统计摘要。"""
     abs_corr = np.abs(corr)
     return {
         "mean_corr": float(np.mean(corr)),
@@ -113,7 +110,6 @@ def build_region_corr_stats(
     latent_regions: Mapping[str, Iterable[int]],
     motor_regions: Mapping[str, Iterable[int]],
 ) -> Dict[str, object]:
-    """统计区域相关性（同名区域统计 + 全区域组合矩阵统计）。"""
     pair_stats: Dict[str, object] = {}
     matrix_stats: Dict[str, object] = {}
 
@@ -142,21 +138,43 @@ def build_region_corr_stats(
     }
 
 
-def _predict_in_batches(model: torch.nn.Module, x_np: np.ndarray, device: torch.device, batch_size: int) -> np.ndarray:
-    """按 batch 做前向推理并返回拼接后的预测数组。"""
+def _predict_from_latent_batches(
+    model: torch.nn.Module,
+    z_np: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
     preds: List[np.ndarray] = []
     model.eval()
     with torch.inference_mode():
-        for s in range(0, x_np.shape[0], batch_size):
-            e = min(s + batch_size, x_np.shape[0])
-            xb = torch.from_numpy(x_np[s:e]).to(device=device, dtype=torch.float32)
-            yb = model(xb).detach().cpu().numpy()
+        for s in range(0, z_np.shape[0], batch_size):
+            e = min(s + batch_size, z_np.shape[0])
+            zb = torch.from_numpy(z_np[s:e]).to(device=device, dtype=torch.float32)
+            yb = model.forward_from_latent(zb).detach().cpu().numpy()
             preds.append(yb)
     return np.vstack(preds).astype(np.float64)
 
 
+def _encode_latent_batches(
+    model: torch.nn.Module,
+    x: Mapping[str, np.ndarray],
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    # Extract z24 from encoder path only (without motor head forward).
+    latents: List[np.ndarray] = []
+    n = int(next(iter(x.values())).shape[0])
+    model.eval()
+    with torch.inference_mode():
+        for s in range(0, n, batch_size):
+            e = min(s + batch_size, n)
+            xb = {k: torch.from_numpy(v[s:e]).to(device=device, dtype=torch.float32) for k, v in x.items()}
+            z = model.encode(xb)["latent24"].detach().cpu().numpy()
+            latents.append(z)
+    return np.vstack(latents).astype(np.float64)
+
+
 def _rank_motor_delta(delta_per_motor: np.ndarray, motor_names: List[str], top_k: int) -> List[Dict[str, object]]:
-    """对电机变化幅度做降序排名并截取 top-k。"""
     order = np.argsort(-delta_per_motor)
     out: List[Dict[str, object]] = []
     for idx in order[: max(1, top_k)].tolist():
@@ -172,7 +190,7 @@ def _rank_motor_delta(delta_per_motor: np.ndarray, motor_names: List[str], top_k
 
 def perturbation_sensitivity_analysis(
     model: torch.nn.Module,
-    x: np.ndarray,
+    z: np.ndarray,
     device: torch.device,
     latent_regions: Mapping[str, Iterable[int]],
     motor_names: List[str],
@@ -181,11 +199,11 @@ def perturbation_sensitivity_analysis(
     random_seed: int,
     top_k: int,
 ) -> Dict[str, object]:
-    """做区域置零与扰动实验，计算电机输出变化敏感性。"""
-    base_pred = _predict_in_batches(model, x, device=device, batch_size=batch_size)
+    # Region-wise zeroing/noise perturbation is done in z-space, then passed to shared motor head.
+    base_pred = _predict_from_latent_batches(model, z, device=device, batch_size=batch_size)
 
     rng = np.random.default_rng(random_seed)
-    x_std = np.std(x, axis=0).astype(np.float64)
+    z_std = np.std(z, axis=0).astype(np.float64)
 
     out: Dict[str, object] = {
         "noise_std_scale": float(noise_std_scale),
@@ -196,16 +214,16 @@ def perturbation_sensitivity_analysis(
     for region, idxs in latent_regions.items():
         idx_arr = np.asarray(list(idxs), dtype=np.int64)
 
-        x_zero = x.copy()
-        x_zero[:, idx_arr] = 0.0
-        pred_zero = _predict_in_batches(model, x_zero, device=device, batch_size=batch_size)
+        z_zero = z.copy()
+        z_zero[:, idx_arr] = 0.0
+        pred_zero = _predict_from_latent_batches(model, z_zero, device=device, batch_size=batch_size)
         delta_zero = np.mean(np.abs(pred_zero - base_pred), axis=0)
 
-        x_noise = x.copy()
-        std_vec = x_std[idx_arr] * float(noise_std_scale)
-        noise = rng.normal(loc=0.0, scale=std_vec, size=(x.shape[0], idx_arr.shape[0]))
-        x_noise[:, idx_arr] = x_noise[:, idx_arr] + noise
-        pred_noise = _predict_in_batches(model, x_noise, device=device, batch_size=batch_size)
+        z_noise = z.copy()
+        std_vec = z_std[idx_arr] * float(noise_std_scale)
+        noise = rng.normal(loc=0.0, scale=std_vec, size=(z.shape[0], idx_arr.shape[0]))
+        z_noise[:, idx_arr] = z_noise[:, idx_arr] + noise
+        pred_noise = _predict_from_latent_batches(model, z_noise, device=device, batch_size=batch_size)
         delta_noise = np.mean(np.abs(pred_noise - base_pred), axis=0)
 
         out["regions"][region] = {
@@ -224,7 +242,6 @@ def perturbation_sensitivity_analysis(
 
 
 def save_corr_heatmap_png(corr: np.ndarray, out_png: Path) -> bool:
-    """尝试保存相关矩阵热图；缺少 matplotlib 时返回 False。"""
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -245,7 +262,6 @@ def save_corr_heatmap_png(corr: np.ndarray, out_png: Path) -> bool:
 
 
 def resolve_split_path(data_cfg: Mapping[str, object], split: str) -> Path:
-    """根据 split 名称解析配置中的 split 文件路径。"""
     key = f"{split}_split"
     if key not in data_cfg:
         raise RuntimeError(f"config.data missing split path: {key}")
@@ -253,14 +269,12 @@ def resolve_split_path(data_cfg: Mapping[str, object], split: str) -> Path:
 
 
 def resolve_device(device_cfg: str) -> torch.device:
-    """根据配置字符串与 CUDA 可用性选择运行设备。"""
     if device_cfg.startswith("cuda") and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
 
 def main() -> None:
-    """主流程：加载数据与模型，输出相关性和扰动敏感性分析文件。"""
     args = parse_args()
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
@@ -271,21 +285,32 @@ def main() -> None:
 
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
-    model_cfg = cfg["model"]
     metrics_cfg = cfg.get("metrics", {})
 
     device = resolve_device(str(train_cfg["device"]))
     ckpt_path, eval_output_dir, run_name = resolve_eval_ckpt_path(cfg, args.ckpt)
 
     split_path = resolve_split_path(data_cfg, split)
-    latent_map = load_latent24_map(Path(str(data_cfg["latent_file"])))
     target_map = load_target30_map(Path(str(data_cfg["target_file"])))
-    x, y = build_xy_from_split(split_path, latent_map, target_map)
+    feature385_file = Path(str(data_cfg["feature385_file"])) if "feature385_file" in data_cfg else None
+    x, y = build_region_inputs_from_split(
+        split_pkl=split_path,
+        abs_file=Path(str(data_cfg["abs_file"])),
+        rel_file=Path(str(data_cfg["rel_file"])),
+        target30_map=target_map,
+        feature385_file=feature385_file,
+    )
 
-    corr_lm = _corr_matrix(x.astype(np.float64), y.astype(np.float64))
+    model = MotorRegressorMLP().to(device)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    z = _encode_latent_batches(model=model, x=x, device=device, batch_size=int(train_cfg.get("batch_size", 256)))
+    corr_lm = _corr_matrix(z.astype(np.float64), y.astype(np.float64))
 
     motor_regions = load_motor_region_indices(metrics_cfg=metrics_cfg, dim=y.shape[1])
-    latent_regions = load_latent_region_indices(explain_cfg=explain_cfg, dim=x.shape[1])
+    latent_regions = load_latent_region_indices(explain_cfg=explain_cfg, dim=z.shape[1])
     motor_names = load_motor_names(metrics_cfg=metrics_cfg, dim=y.shape[1])
 
     region_corr = build_region_corr_stats(
@@ -294,20 +319,10 @@ def main() -> None:
         motor_regions=motor_regions,
     )
 
-    model = MotorRegressorMLP(
-        input_dim=int(model_cfg["input_dim"]),
-        hidden1=int(model_cfg["hidden_dim1"]),
-        hidden2=int(model_cfg["hidden_dim2"]),
-        output_dim=int(model_cfg["output_dim"]),
-    ).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
     perturb_cfg = explain_cfg.get("perturbation", {}) if isinstance(explain_cfg, Mapping) else {}
     sens = perturbation_sensitivity_analysis(
         model=model,
-        x=x.astype(np.float64),
+        z=z.astype(np.float64),
         device=device,
         latent_regions=latent_regions,
         motor_names=motor_names,
@@ -336,8 +351,8 @@ def main() -> None:
 
     summary = {
         "split": split,
-        "samples": int(x.shape[0]),
-        "latent_dim": int(x.shape[1]),
+        "samples": int(z.shape[0]),
+        "latent_dim": int(z.shape[1]),
         "motor_dim": int(y.shape[1]),
         "device": str(device),
         "ckpt": str(ckpt_path),
@@ -356,7 +371,7 @@ def main() -> None:
     }
     summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"[DONE] explainability split={split} samples={x.shape[0]} ckpt={ckpt_path}")
+    print(f"[DONE] explainability split={split} samples={z.shape[0]} ckpt={ckpt_path}")
     print(f"[DONE] out_dir={run_dir}")
     print(f"[DONE] summary={summary_json}")
 
