@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regional gated regressor:
+"""Regional gated regressor (compare5 output head):
 [ABS, REL, Pose] -> z24 (regional latent) -> shared/base + residual heads -> y30.
 """
 
@@ -62,7 +62,7 @@ class GateFusionWithPose(nn.Module):
 class RegionalMotorRegressor(nn.Module):
     """
     [ABS, REL, Pose] -> regional encoders -> gated fusion -> z24
-    z24 -> h_shared -> y_base + local residuals (brow/mouth) -> y30
+    z24 -> h_shared -> y_base + local residuals (brow + jaw/mouth joint) -> y30
     """
 
     def __init__(self):
@@ -70,8 +70,10 @@ class RegionalMotorRegressor(nn.Module):
         # Motor output indices used by local residual heads.
         self.register_buffer("brow_out_idx", torch.tensor([0, 1, 2, 3], dtype=torch.long), persistent=False)
         self.register_buffer(
-            "mouth_out_idx",
-            torch.tensor([15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29], dtype=torch.long),
+            # jaw region (7): 10,11,12,13,14,27,28
+            # mouth region (13): 15..26,29
+            "jawmouth_out_idx",
+            torch.tensor([10, 11, 12, 13, 14, 27, 28, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29], dtype=torch.long),
             persistent=False,
         )
 
@@ -128,12 +130,13 @@ class RegionalMotorRegressor(nn.Module):
             nn.Linear(32, 4),
         )
 
-        # Mouth residual: [h_shared(64), z_mouth(10), z_global(2)] -> delta(13)
-        self.mouth_residual_head = nn.Sequential(
-            nn.Linear(76, 32),
+        # Jaw+mouth joint residual:
+        # [h_shared(64), z_jaw(4), z_mouth(10), z_global(2)] -> delta(20)
+        self.jawmouth_residual_head = nn.Sequential(
+            nn.Linear(80, 48),
             nn.GELU(),
-            nn.LayerNorm(32),
-            nn.Linear(32, 13),
+            nn.LayerNorm(48),
+            nn.Linear(48, 20),
         )
 
     def encode(self, x: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -176,6 +179,7 @@ class RegionalMotorRegressor(nn.Module):
     def _forward_heads_from_latent(self, latent24: torch.Tensor) -> Dict[str, torch.Tensor]:
         # Split latent24 into region chunks.
         z_brow = latent24[:, 0:4]
+        z_jaw = latent24[:, 18:22]
         z_mouth = latent24[:, 8:18]
         z_global = latent24[:, 22:24]
 
@@ -183,19 +187,19 @@ class RegionalMotorRegressor(nn.Module):
         y_base = self.base_head(h_shared)
 
         brow_in = torch.cat([h_shared, z_brow, z_global], dim=1)
-        mouth_in = torch.cat([h_shared, z_mouth, z_global], dim=1)
+        jawmouth_in = torch.cat([h_shared, z_jaw, z_mouth, z_global], dim=1)
         delta_brow = self.brow_residual_head(brow_in)
-        delta_mouth = self.mouth_residual_head(mouth_in)
+        delta_jawmouth = self.jawmouth_residual_head(jawmouth_in)
 
         y = y_base.clone()
         y[:, self.brow_out_idx] = y[:, self.brow_out_idx] + delta_brow
-        y[:, self.mouth_out_idx] = y[:, self.mouth_out_idx] + delta_mouth
+        y[:, self.jawmouth_out_idx] = y[:, self.jawmouth_out_idx] + delta_jawmouth
 
         return {
             "h_shared": h_shared,
             "y_base": y_base,
             "delta_brow": delta_brow,
-            "delta_mouth": delta_mouth,
+            "delta_jawmouth": delta_jawmouth,
             "y": y,
         }
 

@@ -24,7 +24,7 @@ train:
   batch_size: 256
   num_workers: 0
   lr: 0.001
-  output_dir: "D:/code/AU+landmark/dataset/motor_regression_compare4"
+  output_dir: "D:/code/AU+landmark/dataset/motor_regression_compare5"
   # 是否将每次训练写入独立子目录（run_001/run_002/...）
   use_run_subdir: true
   # run 子目录前缀
