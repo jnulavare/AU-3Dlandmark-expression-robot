@@ -18,7 +18,7 @@ import yaml
 from data_utils import build_region_inputs_from_split, load_target30_map
 from eval_metrics import load_motor_names, load_motor_region_indices
 from model import MotorRegressorMLP
-from run_utils import resolve_eval_ckpt_path
+from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
 DEFAULT_LATENT_REGION_INDICES: Dict[str, List[int]] = {
@@ -285,6 +285,7 @@ def main() -> None:
 
     data_cfg = cfg["data"]
     train_cfg = cfg["train"]
+    eval_cfg = cfg.get("eval", {})
     metrics_cfg = cfg.get("metrics", {})
 
     device = resolve_device(str(train_cfg["device"]))
@@ -302,8 +303,9 @@ def main() -> None:
     )
 
     model = MotorRegressorMLP().to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    use_ema = bool(eval_cfg.get("use_ema", True))
+    model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
     model.eval()
 
     z = _encode_latent_batches(model=model, x=x, device=device, batch_size=int(train_cfg.get("batch_size", 256)))

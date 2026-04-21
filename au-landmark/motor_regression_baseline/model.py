@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""Regional gated regressor (compare5 output head):
-[ABS, REL, Pose] -> z24 (regional latent) -> shared/base + residual heads -> y30.
+"""Regional gated regressor (branch6).
+
+Backbone:
+[ABS, REL, Pose] -> regional encoders -> z24
+
+Output head:
+z24 -> input projection -> pre-LN residual MLP trunk -> h_shared(96)
+h_shared -> base head -> y_base(30)
+[h_shared, z_brow, z_global] -> brow residual head -> delta_brow(4)
+[h_shared, z_mouth, z_global] -> mouth residual head -> delta_mouth(13)
+y = y_base + alpha_b * delta_brow + alpha_m * delta_mouth (sparse add by indices)
 """
 
 from __future__ import annotations
@@ -59,25 +68,41 @@ class GateFusionWithPose(nn.Module):
         return alpha * h_abs + (1.0 - alpha) * h_rel
 
 
+class PreLNResidualMLPBlock(nn.Module):
+    """Pre-LN residual MLP block.
+
+    x -> LN -> Linear(up) -> GELU -> Dropout -> Linear(down) -> add(x)
+    """
+
+    def __init__(self, hidden_dim: int = 96, expand_dim: int = 192, dropout: float = 0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim, expand_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(p=dropout)
+        self.fc2 = nn.Linear(expand_dim, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        h = self.fc1(h)
+        h = self.act(h)
+        h = self.drop(h)
+        h = self.fc2(h)
+        return x + h
+
+
 class RegionalMotorRegressor(nn.Module):
-    """
-    [ABS, REL, Pose] -> regional encoders -> gated fusion -> z24
-    z24 -> h_shared -> y_base + local residuals (brow + jaw/mouth joint) -> y30
-    """
+    """Regional encoder + branch6 output head."""
 
     def __init__(self):
         super().__init__()
-        # Motor output indices used by local residual heads.
         self.register_buffer("brow_out_idx", torch.tensor([0, 1, 2, 3], dtype=torch.long), persistent=False)
         self.register_buffer(
-            # jaw region (7): 10,11,12,13,14,27,28
-            # mouth region (13): 15..26,29
-            "jawmouth_out_idx",
-            torch.tensor([10, 11, 12, 13, 14, 27, 28, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29], dtype=torch.long),
+            "mouth_out_idx",
+            torch.tensor([15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29], dtype=torch.long),
             persistent=False,
         )
 
-        # A shared pose embedding is injected into all region fusion gates.
         pose_dim = 8
         self.pose_encoder = PoseEncoder(input_dim=3, hidden_dim=16, output_dim=pose_dim)
 
@@ -104,40 +129,43 @@ class RegionalMotorRegressor(nn.Module):
         self.jaw_projector = nn.Linear(16, 4)
         self.global_projector = nn.Linear(8, 2)
 
-        # Shared trunk: z24 -> h_shared (R^64)
-        self.shared_trunk = nn.Sequential(
-            nn.Linear(24, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-            nn.Dropout(p=0.1),
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
+        # Input projection: 24 -> 96
+        self.input_proj = nn.Linear(24, 96)
+        # Trunk: 2 pre-LN residual MLP blocks
+        self.trunk_blocks = nn.ModuleList(
+            [
+                PreLNResidualMLPBlock(hidden_dim=96, expand_dim=192, dropout=0.1),
+                PreLNResidualMLPBlock(hidden_dim=96, expand_dim=192, dropout=0.1),
+            ]
         )
 
-        # Base head predicts all 30 motors from global hidden representation.
+        # Base head: LN -> 96 -> GELU -> 30
         self.base_head = nn.Sequential(
-            nn.Linear(64, 64),
+            nn.LayerNorm(96),
+            nn.Linear(96, 96),
             nn.GELU(),
-            nn.Linear(64, 30),
+            nn.Linear(96, 30),
         )
 
-        # Brow residual: [h_shared(64), z_brow(4), z_global(2)] -> delta(4)
+        # Brow residual: [h_shared(96), z_brow(4), z_global(2)] -> 102 -> 4
         self.brow_residual_head = nn.Sequential(
-            nn.Linear(70, 32),
-            nn.GELU(),
-            nn.LayerNorm(32),
-            nn.Linear(32, 4),
-        )
-
-        # Jaw+mouth joint residual:
-        # [h_shared(64), z_jaw(4), z_mouth(10), z_global(2)] -> delta(20)
-        self.jawmouth_residual_head = nn.Sequential(
-            nn.Linear(80, 48),
+            nn.Linear(102, 48),
             nn.GELU(),
             nn.LayerNorm(48),
-            nn.Linear(48, 20),
+            nn.Linear(48, 4),
         )
+
+        # Mouth residual: [h_shared(96), z_mouth(10), z_global(2)] -> 108 -> 13
+        self.mouth_residual_head = nn.Sequential(
+            nn.Linear(108, 48),
+            nn.GELU(),
+            nn.LayerNorm(48),
+            nn.Linear(48, 13),
+        )
+
+        # Learnable residual scales.
+        self.alpha_b = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.alpha_m = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def encode(self, x: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         pose = x["pose"]
@@ -177,29 +205,32 @@ class RegionalMotorRegressor(nn.Module):
         }
 
     def _forward_heads_from_latent(self, latent24: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # Split latent24 into region chunks.
         z_brow = latent24[:, 0:4]
-        z_jaw = latent24[:, 18:22]
         z_mouth = latent24[:, 8:18]
         z_global = latent24[:, 22:24]
 
-        h_shared = self.shared_trunk(latent24)
+        h_shared = self.input_proj(latent24)
+        for block in self.trunk_blocks:
+            h_shared = block(h_shared)
+
         y_base = self.base_head(h_shared)
 
         brow_in = torch.cat([h_shared, z_brow, z_global], dim=1)
-        jawmouth_in = torch.cat([h_shared, z_jaw, z_mouth, z_global], dim=1)
+        mouth_in = torch.cat([h_shared, z_mouth, z_global], dim=1)
         delta_brow = self.brow_residual_head(brow_in)
-        delta_jawmouth = self.jawmouth_residual_head(jawmouth_in)
+        delta_mouth = self.mouth_residual_head(mouth_in)
 
         y = y_base.clone()
-        y[:, self.brow_out_idx] = y[:, self.brow_out_idx] + delta_brow
-        y[:, self.jawmouth_out_idx] = y[:, self.jawmouth_out_idx] + delta_jawmouth
+        y[:, self.brow_out_idx] = y[:, self.brow_out_idx] + self.alpha_b * delta_brow
+        y[:, self.mouth_out_idx] = y[:, self.mouth_out_idx] + self.alpha_m * delta_mouth
 
         return {
             "h_shared": h_shared,
             "y_base": y_base,
             "delta_brow": delta_brow,
-            "delta_jawmouth": delta_jawmouth,
+            "delta_mouth": delta_mouth,
+            "alpha_b": self.alpha_b,
+            "alpha_m": self.alpha_m,
             "y": y,
         }
 
@@ -214,5 +245,5 @@ class RegionalMotorRegressor(nn.Module):
         return pred
 
 
-# Keep this alias so old imports continue to work.
+# Keep alias for compatibility with existing imports/scripts.
 MotorRegressorMLP = RegionalMotorRegressor

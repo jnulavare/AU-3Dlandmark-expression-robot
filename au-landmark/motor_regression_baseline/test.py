@@ -25,7 +25,7 @@ from eval_metrics import (
     load_motor_region_indices,
 )
 from model import MotorRegressorMLP
-from run_utils import resolve_eval_ckpt_path
+from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
 def _as_bool(v: object, default: bool) -> bool:
@@ -82,6 +82,7 @@ def main() -> None:
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     device = resolve_device(str(cfg["train"]["device"]))
     metrics_cfg = cfg.get("metrics", {})
+    eval_cfg = cfg.get("eval", {})
     boundary_eval_cfg = resolve_boundary_eval_cfg(cfg)
 
     ckpt_path, output_dir, run_name = resolve_eval_ckpt_path(cfg, args.ckpt)
@@ -109,8 +110,9 @@ def main() -> None:
 
     # 2) 加载最优/指定 checkpoint，执行完整测试集推理。
     model = MotorRegressorMLP().to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    use_ema = _as_bool(eval_cfg.get("use_ema", True), default=True)
+    model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
     model.eval()
 
     y_true, y_pred_raw = collect_predictions(model, loader, device)

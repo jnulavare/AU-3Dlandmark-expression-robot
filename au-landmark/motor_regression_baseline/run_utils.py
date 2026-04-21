@@ -143,3 +143,17 @@ def resolve_eval_ckpt_path(cfg: Mapping[str, object], explicit_ckpt: Path | None
     if not ckpt_path.exists():
         raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
     return ckpt_path, run_dir, run_dir.name
+
+
+def select_eval_state_dict(ckpt_obj: Mapping[str, object], use_ema: bool = True):
+    """Select model weights for evaluation.
+
+    Priority:
+    1) ema_state_dict (if use_ema=True and present)
+    2) model_state_dict
+    """
+    if use_ema and "ema_state_dict" in ckpt_obj:
+        return ckpt_obj["ema_state_dict"]
+    if "model_state_dict" not in ckpt_obj:
+        raise RuntimeError("checkpoint missing model_state_dict")
+    return ckpt_obj["model_state_dict"]

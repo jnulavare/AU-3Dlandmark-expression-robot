@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-"""Training entry for regional ABS/REL/Pose -> z24 -> motor30 model."""
+"""Training entry for branch6 regional model.
+
+Key changes in this version:
+- Pre-LN residual trunk + base/residual heads in model.py
+- Weighted SmoothL1 task loss by facial region
+- EMA (exponential moving average) model for validation/checkpoint
+- Early stopping with minimum epoch guard
+"""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import random
 import time
 from pathlib import Path
+from typing import Dict, Mapping
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
 from data_utils import RegionalInputDataset, build_region_inputs_from_split, load_target30_map
+from eval_metrics import load_motor_region_indices
 from model import MotorRegressorMLP
 from run_utils import resolve_train_output_dir
 
@@ -31,7 +42,6 @@ def _as_bool(v: object, default: bool) -> bool:
 
 
 def resolve_boundary_train_cfg(cfg: dict) -> dict:
-    # 训练阶段的边界配置优先级：boundary.train > boundary > metrics 默认值。
     metrics_cfg = cfg.get("metrics", {})
     boundary_cfg = cfg.get("boundary", {})
     train_boundary_cfg = boundary_cfg.get("train", {}) if isinstance(boundary_cfg, dict) else {}
@@ -49,14 +59,30 @@ def resolve_boundary_train_cfg(cfg: dict) -> dict:
     }
 
 
+def resolve_region_loss_weights(cfg: dict) -> Dict[str, float]:
+    """Resolve weighted SmoothL1 coefficients.
+
+    Defaults requested by user:
+    brow=1.25, eye=1.0, jaw=1.0, mouth=1.0
+    """
+    default = {"brow": 1.25, "eye": 1.0, "jaw": 1.0, "mouth": 1.0}
+    train_cfg = cfg.get("train", {})
+    weights_cfg = train_cfg.get("region_loss_weights", {})
+    if not isinstance(weights_cfg, Mapping):
+        weights_cfg = {}
+    out = {}
+    for k, dv in default.items():
+        out[k] = float(weights_cfg.get(k, dv))
+    return out
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train regional-gated ABS/REL/Pose -> z24 -> motor30 regressor.")
+    p = argparse.ArgumentParser(description="Train branch6 regional model.")
     p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
     return p.parse_args()
 
 
 def set_seed(seed: int) -> None:
-    # 固定随机种子，保证训练过程可复现（含 CUDA）。
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -70,12 +96,27 @@ def resolve_device(device_cfg: str) -> torch.device:
 
 
 def move_inputs_to_device(x: dict, device: torch.device) -> dict:
-    # 输入是“分区域特征字典”，需要把每个分支都搬到同一 device。
     return {k: v.to(device, non_blocking=True) for k, v in x.items()}
 
 
 def compute_boundary_loss_torch(pred: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
     return (torch.relu(lo - pred) + torch.relu(pred - hi)).mean()
+
+
+def compute_weighted_smooth_l1_task_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    region_indices_t: Mapping[str, torch.Tensor],
+    region_weights: Mapping[str, float],
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    per_region: Dict[str, torch.Tensor] = {}
+    total = pred.new_tensor(0.0)
+    for region in ("brow", "eye", "jaw", "mouth"):
+        idx = region_indices_t[region]
+        loss_r = F.smooth_l1_loss(pred.index_select(1, idx), target.index_select(1, idx), reduction="mean")
+        per_region[region] = loss_r
+        total = total + float(region_weights.get(region, 1.0)) * loss_r
+    return total, per_region
 
 
 def evaluate_mae(
@@ -86,7 +127,6 @@ def evaluate_mae(
     lo: float,
     hi: float,
 ) -> float:
-    # 统一验证口径：可选先 clip 再计算 MAE，与评估脚本保持一致。
     model.eval()
     mae_sum = 0.0
     n = 0
@@ -103,6 +143,27 @@ def evaluate_mae(
     return mae_sum / max(n, 1)
 
 
+class ModelEMA:
+    """Maintain exponential moving average of model parameters."""
+
+    def __init__(self, model: torch.nn.Module, beta: float = 0.999):
+        self.beta = float(beta)
+        self.ema_model = copy.deepcopy(model).eval()
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        model_state = model.state_dict()
+        ema_state = self.ema_model.state_dict()
+        for k, ema_v in ema_state.items():
+            model_v = model_state[k].detach()
+            if not ema_v.dtype.is_floating_point:
+                ema_v.copy_(model_v)
+            else:
+                ema_v.mul_(self.beta).add_(model_v, alpha=(1.0 - self.beta))
+
+
 def main() -> None:
     args = parse_args()
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -110,9 +171,15 @@ def main() -> None:
     seed = int(cfg["train"]["seed"])
     set_seed(seed)
     boundary_cfg = resolve_boundary_train_cfg(cfg)
+    region_weights = resolve_region_loss_weights(cfg)
 
-    device = resolve_device(str(cfg["train"]["device"]))
-    output_dir, run_name = resolve_train_output_dir(cfg["train"])
+    train_cfg = cfg["train"]
+    ema_decay = float(train_cfg.get("ema_decay", 0.999))
+    use_ema_for_val = _as_bool(train_cfg.get("use_ema_for_val", True), default=True)
+    min_epochs_before_early_stop = int(train_cfg.get("min_epochs_before_early_stop", 120))
+
+    device = resolve_device(str(train_cfg["device"]))
+    output_dir, run_name = resolve_train_output_dir(train_cfg)
 
     abs_file = Path(cfg["data"]["abs_file"])
     rel_file = Path(cfg["data"]["rel_file"])
@@ -133,7 +200,16 @@ def main() -> None:
         f"boundary_loss={boundary_cfg['enable_boundary_loss']} "
         f"weight={boundary_cfg['boundary_loss_weight']}"
     )
-    # 1) 读取 target30，并按 split 顺序构建输入，确保样本顺序一致。
+    print(
+        "[INFO] region_weights "
+        f"brow={region_weights['brow']} eye={region_weights['eye']} "
+        f"jaw={region_weights['jaw']} mouth={region_weights['mouth']}"
+    )
+    print(
+        f"[INFO] ema_decay={ema_decay} use_ema_for_val={use_ema_for_val} "
+        f"min_epochs_before_early_stop={min_epochs_before_early_stop}"
+    )
+
     print("[INFO] loading target map...")
     target_map = load_target30_map(target_file)
 
@@ -142,6 +218,7 @@ def main() -> None:
         print(f"[INFO] using feature385_file={feature385_file}")
     else:
         print(f"[INFO] using abs_file={abs_file} rel_file={rel_file}")
+
     x_train, y_train = build_region_inputs_from_split(
         train_split,
         abs_file=abs_file,
@@ -161,11 +238,19 @@ def main() -> None:
         f"feature385={sum(v.shape[1] for v in x_train.values())}"
     )
 
+    region_indices = load_motor_region_indices(metrics_cfg=cfg.get("metrics", {}), dim=int(y_train.shape[1]))
+    for key in ("brow", "eye", "jaw", "mouth"):
+        if key not in region_indices:
+            raise RuntimeError(f"missing region indices in metrics.motor_region_indices: '{key}'")
+    region_indices_t = {
+        k: torch.tensor(v, dtype=torch.long, device=device) for k, v in region_indices.items() if k in {"brow", "eye", "jaw", "mouth"}
+    }
+
     train_ds = RegionalInputDataset(x_train, y_train)
     val_ds = RegionalInputDataset(x_val, y_val)
 
-    batch_size = int(cfg["train"]["batch_size"])
-    num_workers = int(cfg["train"].get("num_workers", 0))
+    batch_size = int(train_cfg["batch_size"])
+    num_workers = int(train_cfg.get("num_workers", 0))
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -181,14 +266,13 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # 2) 初始化模型、损失函数与优化器。
     model = MotorRegressorMLP().to(device)
-    criterion = torch.nn.L1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg["train"]["lr"]))
+    ema = ModelEMA(model, beta=ema_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(train_cfg["lr"]))
 
-    epochs = int(cfg["train"]["epochs"])
-    patience = int(cfg["train"]["early_stopping"]["patience"])
-    min_delta = float(cfg["train"]["early_stopping"]["min_delta"])
+    epochs = int(train_cfg["epochs"])
+    patience = int(train_cfg["early_stopping"]["patience"])
+    min_delta = float(train_cfg["early_stopping"]["min_delta"])
 
     best_val = float("inf")
     best_epoch = -1
@@ -199,16 +283,29 @@ def main() -> None:
 
     with history_path.open("w", encoding="utf-8", newline="") as f_hist:
         writer = csv.writer(f_hist)
-        writer.writerow(["epoch", "train_loss_l1", "train_boundary_loss", "train_total_loss", "val_mae"])
+        writer.writerow(
+            [
+                "epoch",
+                "train_task_smoothl1_weighted",
+                "train_boundary_loss",
+                "train_total_loss",
+                "train_brow_loss",
+                "train_eye_loss",
+                "train_jaw_loss",
+                "train_mouth_loss",
+                "val_mae",
+            ]
+        )
 
         t0 = time.time()
-        # 3) 标准训练循环：任务损失 + 可选边界惩罚（限制输出越界）。
         for epoch in range(1, epochs + 1):
             model.train()
             task_loss_sum = 0.0
             boundary_loss_sum = 0.0
             total_loss_sum = 0.0
+            region_loss_sums = {"brow": 0.0, "eye": 0.0, "jaw": 0.0, "mouth": 0.0}
             n = 0
+
             for x, y in train_loader:
                 x = move_inputs_to_device(x, device=device)
                 y = y.to(device, non_blocking=True)
@@ -218,8 +315,13 @@ def main() -> None:
                     if boundary_cfg["clamp_for_task_loss"]
                     else raw_pred
                 )
-                # 任务损失可用 clamp 后的预测；边界损失始终基于 raw_pred 计算越界量。
-                task_loss = criterion(pred_for_task, y)
+
+                task_loss, per_region = compute_weighted_smooth_l1_task_loss(
+                    pred=pred_for_task,
+                    target=y,
+                    region_indices_t=region_indices_t,
+                    region_weights=region_weights,
+                )
                 boundary_loss = compute_boundary_loss_torch(raw_pred, lo=boundary_cfg["lo"], hi=boundary_cfg["hi"])
                 if boundary_cfg["enable_boundary_loss"]:
                     loss = task_loss + float(boundary_cfg["boundary_loss_weight"]) * boundary_loss
@@ -229,29 +331,47 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
+                ema.update(model)
 
                 bs = int(y.shape[0])
                 task_loss_sum += float(task_loss.item()) * bs
                 boundary_loss_sum += float(boundary_loss.item()) * bs
                 total_loss_sum += float(loss.item()) * bs
+                for key in region_loss_sums:
+                    region_loss_sums[key] += float(per_region[key].item()) * bs
                 n += bs
 
             train_task_loss = task_loss_sum / max(n, 1)
             train_boundary_loss = boundary_loss_sum / max(n, 1)
             train_total_loss = total_loss_sum / max(n, 1)
+            train_region_losses = {k: v / max(n, 1) for k, v in region_loss_sums.items()}
+
+            eval_model = ema.ema_model if use_ema_for_val else model
             val_mae = evaluate_mae(
-                model,
+                eval_model,
                 val_loader,
                 device,
                 clip_predictions=bool(boundary_cfg["clip_predictions_in_eval"]),
                 lo=float(boundary_cfg["lo"]),
                 hi=float(boundary_cfg["hi"]),
             )
-            writer.writerow([epoch, train_task_loss, train_boundary_loss, train_total_loss, val_mae])
+
+            writer.writerow(
+                [
+                    epoch,
+                    train_task_loss,
+                    train_boundary_loss,
+                    train_total_loss,
+                    train_region_losses["brow"],
+                    train_region_losses["eye"],
+                    train_region_losses["jaw"],
+                    train_region_losses["mouth"],
+                    val_mae,
+                ]
+            )
             f_hist.flush()
 
             improved = val_mae < (best_val - min_delta)
-            # 4) 以验证集 MAE 作为早停与 best checkpoint 的判定标准。
             if improved:
                 best_val = val_mae
                 best_epoch = epoch
@@ -261,6 +381,9 @@ def main() -> None:
                         "epoch": epoch,
                         "best_val_mae": best_val,
                         "model_state_dict": model.state_dict(),
+                        "ema_state_dict": ema.ema_model.state_dict(),
+                        "ema_decay": ema_decay,
+                        "used_ema_for_val": use_ema_for_val,
                         "config": cfg,
                     },
                     best_ckpt,
@@ -270,24 +393,30 @@ def main() -> None:
 
             print(
                 f"[EPOCH {epoch:03d}] "
-                f"train_l1={train_task_loss:.6f} "
-                f"train_boundary={train_boundary_loss:.6f} "
-                f"train_total={train_total_loss:.6f} "
+                f"task={train_task_loss:.6f} "
+                f"boundary={train_boundary_loss:.6f} "
+                f"total={train_total_loss:.6f} "
+                f"brow={train_region_losses['brow']:.6f} "
+                f"eye={train_region_losses['eye']:.6f} "
+                f"jaw={train_region_losses['jaw']:.6f} "
+                f"mouth={train_region_losses['mouth']:.6f} "
                 f"val_mae={val_mae:.6f} best={best_val:.6f}"
             )
 
-            if bad_epochs >= patience:
+            if epoch >= min_epochs_before_early_stop and bad_epochs >= patience:
                 print(f"[INFO] early stopping at epoch={epoch}, best_epoch={best_epoch}")
                 break
 
         elapsed = time.time() - t0
 
-    # 5) 无论是否早停，都保存最后一个 checkpoint，便于复现和排查。
     torch.save(
         {
             "epoch": epoch,
             "best_val_mae": best_val,
             "model_state_dict": model.state_dict(),
+            "ema_state_dict": ema.ema_model.state_dict(),
+            "ema_decay": ema_decay,
+            "used_ema_for_val": use_ema_for_val,
             "config": cfg,
         },
         last_ckpt,
@@ -304,6 +433,13 @@ def main() -> None:
         "run_name": run_name,
         "output_dir": str(output_dir),
         "boundary_train_cfg": boundary_cfg,
+        "region_loss_weights": region_weights,
+        "ema": {"enabled": True, "decay": ema_decay, "used_for_val": use_ema_for_val},
+        "early_stopping": {
+            "patience": patience,
+            "min_delta": min_delta,
+            "min_epochs_before_early_stop": min_epochs_before_early_stop,
+        },
         "paths": {
             "best_ckpt": str(best_ckpt),
             "last_ckpt": str(last_ckpt),
