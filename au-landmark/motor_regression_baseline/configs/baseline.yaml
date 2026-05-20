@@ -24,7 +24,7 @@ train:
   batch_size: 256
   num_workers: 0
   lr: 0.001
-  output_dir: "D:/code/AU+landmark/dataset/motor_regression_compare6"
+  output_dir: "D:/code/AU+landmark/dataset/motor_regression_compare7"
   # EMA for evaluation/checkpoint selection
   ema_decay: 0.999
   use_ema_for_val: true

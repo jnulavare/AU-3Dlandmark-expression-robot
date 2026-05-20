@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test entry for regional ABS/REL/Pose -> z24 -> motor30 model."""
+"""Test entry for REL190 / REL193-Context B1vnext models."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from eval_metrics import (
     load_motor_names,
     load_motor_region_indices,
 )
-from model import MotorRegressorMLP
+from model import build_model_from_config
 from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
@@ -39,7 +39,6 @@ def _as_bool(v: object, default: bool) -> bool:
 
 
 def resolve_boundary_eval_cfg(cfg: dict) -> dict:
-    # 测试阶段边界配置：与 val 口径一致，支持评估前 clip。
     metrics_cfg = cfg.get("metrics", {})
     boundary_cfg = cfg.get("boundary", {})
     lo = float(boundary_cfg.get("lo", metrics_cfg.get("out_range_lo", 0.0)))
@@ -54,8 +53,8 @@ def resolve_boundary_eval_cfg(cfg: dict) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Test regional-gated regressor on test split.")
-    p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
+    p = argparse.ArgumentParser(description="Test B1vnext regressor on test split.")
+    p.add_argument("--config", type=Path, default=Path("configs/b1vnext_rel193_context.yaml"))
     p.add_argument("--ckpt", type=Path, default=None, help="Override config.eval and use explicit checkpoint path")
     return p.parse_args()
 
@@ -67,13 +66,14 @@ def resolve_device(device_cfg: str) -> torch.device:
 
 
 def _context_data_root(data_cfg: dict) -> Path:
-    # 上下文特征默认从数据目录推断，也可在配置里显式指定。
-    if "abs_file" in data_cfg:
-        return Path(str(data_cfg["abs_file"])).parent
+    if "feature190_file" in data_cfg:
+        return Path(str(data_cfg["feature190_file"])).parent
+    if "feature_file" in data_cfg:
+        return Path(str(data_cfg["feature_file"])).parent
     if "rel_file" in data_cfg:
         return Path(str(data_cfg["rel_file"])).parent
-    if "latent_file" in data_cfg:
-        return Path(str(data_cfg["latent_file"])).parent
+    if "abs_file" in data_cfg:
+        return Path(str(data_cfg["abs_file"])).parent
     return Path(".")
 
 
@@ -87,16 +87,25 @@ def main() -> None:
 
     ckpt_path, output_dir, run_name = resolve_eval_ckpt_path(cfg, args.ckpt)
 
-    # 1) 按 test split 顺序构建输入，确保输出指标与样本一一对应。
     target_map = load_target30_map(Path(cfg["data"]["target_file"]))
     split_path = Path(cfg["data"]["test_split"])
-    feature385_file = Path(cfg["data"]["feature385_file"]) if "feature385_file" in cfg["data"] else None
+    rel_file = Path(cfg["data"]["rel_file"])
+    abs_file = Path(cfg["data"].get("abs_file", ""))
+    feature_mode = str(cfg.get("feature_mode", "REL190")).upper()
+    model_name = str(cfg.get("model_name", "B1vnextREL190"))
+    feature_file = Path(
+        cfg["data"].get(
+            "feature_file",
+            cfg["data"].get("feature193_file", cfg["data"].get("feature190_file", "")),
+        )
+    )
     x_test, y_test = build_region_inputs_from_split(
         split_path,
-        abs_file=Path(cfg["data"]["abs_file"]),
-        rel_file=Path(cfg["data"]["rel_file"]),
+        abs_file=abs_file,
+        rel_file=rel_file,
         target30_map=target_map,
-        feature385_file=feature385_file,
+        feature_file=feature_file if feature_file and feature_file.exists() else None,
+        feature_mode=feature_mode,
     )
 
     ds = RegionalInputDataset(x_test, y_test)
@@ -108,8 +117,7 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # 2) 加载最优/指定 checkpoint，执行完整测试集推理。
-    model = MotorRegressorMLP().to(device)
+    model = build_model_from_config(cfg).to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     use_ema = _as_bool(eval_cfg.get("use_ema", True), default=True)
     model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
@@ -122,7 +130,6 @@ def main() -> None:
         y_pred = y_pred_raw
     region_indices = load_motor_region_indices(metrics_cfg=metrics_cfg, dim=y_true.shape[1])
     motor_names = load_motor_names(metrics_cfg=metrics_cfg, dim=y_true.shape[1])
-    # 3) 计算回归指标并保持 JSON 字段结构稳定，便于横向对比。
     metric_dict = compute_regression_metrics(
         y_true=y_true,
         y_pred=y_pred,
@@ -149,7 +156,6 @@ def main() -> None:
 
     context_cfg = metrics_cfg.get("error_context", {})
     pose_slice_cfg = metrics_cfg.get("pose_slice", {})
-    # 只要开启 error_context 或 pose_slice，就先准备上下文数组。
     need_pose_context = bool(context_cfg.get("enabled", True)) or bool(pose_slice_cfg.get("enabled", True))
     context = None
     if need_pose_context:
@@ -160,16 +166,15 @@ def main() -> None:
             )
 
         parent = _context_data_root(cfg["data"])
-        rel_file = Path(context_cfg.get("rel_file", str(parent / "REL_input_vec_X2C_gpu.csv.gz")))
-        abs_file = Path(context_cfg.get("abs_file", str(parent / "ABS_input_vec_X2C_gpu.csv.gz")))
-        context = load_context_feature_arrays(split_indices=split_indices, rel_file=rel_file, abs_file=abs_file)
+        rel_ctx = Path(context_cfg.get("rel_file", str(parent / "REL_input_vec_X2C_gpu.csv.gz")))
+        abs_ctx = Path(context_cfg.get("abs_file", str(parent / "ABS_input_vec_X2C_gpu.csv.gz")))
+        context = load_context_feature_arrays(split_indices=split_indices, rel_file=rel_ctx, abs_file=abs_ctx)
 
     if bool(context_cfg.get("enabled", True)):
         if context is None:
             raise RuntimeError("context should not be None when error_context is enabled")
 
         sample_mae = np.mean(np.abs(y_pred - y_true), axis=1)
-        # 统计样本误差与上下文变量（如 yaw/pitch/roll/energy）的关系。
         metric_dict["error_context_analysis"] = analyze_error_vs_context(
             sample_mae=sample_mae,
             context=context,
@@ -181,7 +186,6 @@ def main() -> None:
     if bool(pose_slice_cfg.get("enabled", True)):
         if context is None:
             raise RuntimeError("context should not be None when pose_slice is enabled")
-        # 按姿态角度分段（frontal/moderate/extreme）比较分桶 MAE。
         metric_dict["pose_slice_mae_analysis"] = compute_pose_slice_mae_analysis(
             y_true=y_true,
             y_pred=y_pred,
@@ -202,6 +206,9 @@ def main() -> None:
         "ckpt": str(ckpt_path),
         "run_name": run_name,
         "device": str(device),
+        "feature_mode": feature_mode,
+        "model_name": model_name,
+        "latent_dim": int(getattr(model, "latent_dim", -1)),
         "region_indices": region_indices,
         "motor_names": motor_names,
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validation entry for regional ABS/REL/Pose -> z24 -> motor30 model."""
+"""Validation entry for REL190 / REL193-Context B1vnext models."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from eval_metrics import (
     load_motor_names,
     load_motor_region_indices,
 )
-from model import MotorRegressorMLP
+from model import build_model_from_config
 from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
@@ -38,7 +38,6 @@ def _as_bool(v: object, default: bool) -> bool:
 
 
 def resolve_boundary_eval_cfg(cfg: dict) -> dict:
-    # 验证阶段边界配置：用于可选 clip 预测值，避免越界值放大指标波动。
     metrics_cfg = cfg.get("metrics", {})
     boundary_cfg = cfg.get("boundary", {})
     lo = float(boundary_cfg.get("lo", metrics_cfg.get("out_range_lo", 0.0)))
@@ -53,8 +52,8 @@ def resolve_boundary_eval_cfg(cfg: dict) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Validate regional-gated regressor on val split.")
-    p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
+    p = argparse.ArgumentParser(description="Validate B1vnext regressor on val split.")
+    p.add_argument("--config", type=Path, default=Path("configs/b1vnext_rel193_context.yaml"))
     p.add_argument("--ckpt", type=Path, default=None, help="Override config.eval and use explicit checkpoint path")
     return p.parse_args()
 
@@ -66,13 +65,15 @@ def resolve_device(device_cfg: str) -> torch.device:
 
 
 def _context_data_root(data_cfg: dict) -> Path:
-    # 上下文特征文件默认与 ABS/REL 同目录，支持在 metrics.error_context 中覆盖。
-    if "abs_file" in data_cfg:
-        return Path(str(data_cfg["abs_file"])).parent
+    # Keep context metric logic unchanged; defaults can still point to abs/rel bundle files.
+    if "feature190_file" in data_cfg:
+        return Path(str(data_cfg["feature190_file"])).parent
+    if "feature_file" in data_cfg:
+        return Path(str(data_cfg["feature_file"])).parent
     if "rel_file" in data_cfg:
         return Path(str(data_cfg["rel_file"])).parent
-    if "latent_file" in data_cfg:
-        return Path(str(data_cfg["latent_file"])).parent
+    if "abs_file" in data_cfg:
+        return Path(str(data_cfg["abs_file"])).parent
     return Path(".")
 
 
@@ -86,16 +87,25 @@ def main() -> None:
 
     ckpt_path, output_dir, run_name = resolve_eval_ckpt_path(cfg, args.ckpt)
 
-    # 1) 按 val split 顺序构建输入，确保预测与标签逐样本对齐。
     target_map = load_target30_map(Path(cfg["data"]["target_file"]))
     split_path = Path(cfg["data"]["val_split"])
-    feature385_file = Path(cfg["data"]["feature385_file"]) if "feature385_file" in cfg["data"] else None
+    rel_file = Path(cfg["data"]["rel_file"])
+    abs_file = Path(cfg["data"].get("abs_file", ""))
+    feature_mode = str(cfg.get("feature_mode", "REL190")).upper()
+    model_name = str(cfg.get("model_name", "B1vnextREL190"))
+    feature_file = Path(
+        cfg["data"].get(
+            "feature_file",
+            cfg["data"].get("feature193_file", cfg["data"].get("feature190_file", "")),
+        )
+    )
     x_val, y_val = build_region_inputs_from_split(
         split_path,
-        abs_file=Path(cfg["data"]["abs_file"]),
-        rel_file=Path(cfg["data"]["rel_file"]),
+        abs_file=abs_file,
+        rel_file=rel_file,
         target30_map=target_map,
-        feature385_file=feature385_file,
+        feature_file=feature_file if feature_file and feature_file.exists() else None,
+        feature_mode=feature_mode,
     )
 
     ds = RegionalInputDataset(x_val, y_val)
@@ -107,8 +117,7 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    # 2) 加载 checkpoint 并做整集推理。
-    model = MotorRegressorMLP().to(device)
+    model = build_model_from_config(cfg).to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     use_ema = _as_bool(eval_cfg.get("use_ema", True), default=True)
     model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
@@ -121,7 +130,7 @@ def main() -> None:
         y_pred = y_pred_raw
     region_indices = load_motor_region_indices(metrics_cfg=metrics_cfg, dim=y_true.shape[1])
     motor_names = load_motor_names(metrics_cfg=metrics_cfg, dim=y_true.shape[1])
-    # 3) 计算主指标；保持字段结构稳定，兼容下游分析脚本。
+
     metric_dict = compute_regression_metrics(
         y_true=y_true,
         y_pred=y_pred,
@@ -148,7 +157,6 @@ def main() -> None:
 
     context_cfg = metrics_cfg.get("error_context", {})
     if bool(context_cfg.get("enabled", True)):
-        # 误差-上下文分析依赖 split 索引，长度必须与评估样本数完全一致。
         split_indices = load_split_indices(split_path)
         if len(split_indices) != int(y_true.shape[0]):
             raise RuntimeError(
@@ -156,12 +164,11 @@ def main() -> None:
             )
 
         parent = _context_data_root(cfg["data"])
-        rel_file = Path(context_cfg.get("rel_file", str(parent / "REL_input_vec_X2C_gpu.csv.gz")))
-        abs_file = Path(context_cfg.get("abs_file", str(parent / "ABS_input_vec_X2C_gpu.csv.gz")))
-        context = load_context_feature_arrays(split_indices=split_indices, rel_file=rel_file, abs_file=abs_file)
+        rel_ctx = Path(context_cfg.get("rel_file", str(parent / "REL_input_vec_X2C_gpu.csv.gz")))
+        abs_ctx = Path(context_cfg.get("abs_file", str(parent / "ABS_input_vec_X2C_gpu.csv.gz")))
+        context = load_context_feature_arrays(split_indices=split_indices, rel_file=rel_ctx, abs_file=abs_ctx)
 
         sample_mae = np.mean(np.abs(y_pred - y_true), axis=1)
-        # 按分桶统计“姿态/能量等上下文”与误差的关联。
         metric_dict["error_context_analysis"] = analyze_error_vs_context(
             sample_mae=sample_mae,
             context=context,
@@ -176,6 +183,9 @@ def main() -> None:
         "ckpt": str(ckpt_path),
         "run_name": run_name,
         "device": str(device),
+        "feature_mode": feature_mode,
+        "model_name": model_name,
+        "latent_dim": int(getattr(model, "latent_dim", -1)),
         "region_indices": region_indices,
         "motor_names": motor_names,
     }

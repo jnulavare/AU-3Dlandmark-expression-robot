@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Training entry for branch6 regional model.
-
-Key changes in this version:
-- Pre-LN residual trunk + base/residual heads in model.py
-- Weighted SmoothL1 task loss by facial region
-- EMA (exponential moving average) model for validation/checkpoint
-- Early stopping with minimum epoch guard
-"""
+"""Training entry for REL190 / REL193-Context B1vnext models."""
 
 from __future__ import annotations
 
@@ -25,9 +18,9 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-from data_utils import RegionalInputDataset, build_region_inputs_from_split, load_target30_map
+from data_utils import RegionalInputDataset, build_region_inputs_from_split, get_region_input_dims, load_target30_map
 from eval_metrics import load_motor_region_indices
-from model import MotorRegressorMLP
+from model import build_model_from_config
 from run_utils import resolve_train_output_dir
 
 
@@ -45,29 +38,27 @@ def resolve_boundary_train_cfg(cfg: dict) -> dict:
     metrics_cfg = cfg.get("metrics", {})
     boundary_cfg = cfg.get("boundary", {})
     train_boundary_cfg = boundary_cfg.get("train", {}) if isinstance(boundary_cfg, dict) else {}
+    loss_cfg = cfg.get("loss", {}) if isinstance(cfg.get("loss", {}), Mapping) else {}
     lo = float(boundary_cfg.get("lo", metrics_cfg.get("out_range_lo", 0.0)))
     hi = float(boundary_cfg.get("hi", metrics_cfg.get("out_range_hi", 1.0)))
     if hi <= lo:
         raise RuntimeError(f"invalid boundary range: lo={lo}, hi={hi}")
+    boundary_weight = float(train_boundary_cfg.get("boundary_loss_weight", loss_cfg.get("boundary_weight", 0.1)))
     return {
         "lo": lo,
         "hi": hi,
         "clip_predictions_in_eval": _as_bool(boundary_cfg.get("clip_predictions_in_eval", True), default=True),
         "clamp_for_task_loss": _as_bool(train_boundary_cfg.get("clamp_for_task_loss", True), default=True),
         "enable_boundary_loss": _as_bool(train_boundary_cfg.get("enable_boundary_loss", True), default=True),
-        "boundary_loss_weight": float(train_boundary_cfg.get("boundary_loss_weight", 0.1)),
+        "boundary_loss_weight": boundary_weight,
     }
 
 
 def resolve_region_loss_weights(cfg: dict) -> Dict[str, float]:
-    """Resolve weighted SmoothL1 coefficients.
-
-    Defaults requested by user:
-    brow=1.25, eye=1.0, jaw=1.0, mouth=1.0
-    """
     default = {"brow": 1.25, "eye": 1.0, "jaw": 1.0, "mouth": 1.0}
     train_cfg = cfg.get("train", {})
-    weights_cfg = train_cfg.get("region_loss_weights", {})
+    loss_cfg = cfg.get("loss", {}) if isinstance(cfg.get("loss", {}), Mapping) else {}
+    weights_cfg = train_cfg.get("region_loss_weights", loss_cfg.get("region_weights", {}))
     if not isinstance(weights_cfg, Mapping):
         weights_cfg = {}
     out = {}
@@ -77,8 +68,8 @@ def resolve_region_loss_weights(cfg: dict) -> Dict[str, float]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train branch6 regional model.")
-    p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
+    p = argparse.ArgumentParser(description="Train B1vnext regressor (REL190 / REL193Context).")
+    p.add_argument("--config", type=Path, default=Path("configs/b1vnext_rel193_context.yaml"))
     return p.parse_args()
 
 
@@ -174,24 +165,37 @@ def main() -> None:
     region_weights = resolve_region_loss_weights(cfg)
 
     train_cfg = cfg["train"]
-    ema_decay = float(train_cfg.get("ema_decay", 0.999))
-    use_ema_for_val = _as_bool(train_cfg.get("use_ema_for_val", True), default=True)
-    min_epochs_before_early_stop = int(train_cfg.get("min_epochs_before_early_stop", 120))
+    ema_cfg = cfg.get("ema", {}) if isinstance(cfg.get("ema", {}), Mapping) else {}
+    early_cfg = cfg.get("early_stopping", {}) if isinstance(cfg.get("early_stopping", {}), Mapping) else {}
+    ema_decay = float(train_cfg.get("ema_decay", cfg.get("ema", {}).get("beta", 0.999)))
+    use_ema_for_val = _as_bool(train_cfg.get("use_ema_for_val", ema_cfg.get("enabled", True)), default=True)
+    min_epochs_before_early_stop = int(train_cfg.get("min_epochs_before_early_stop", early_cfg.get("min_epochs", 120)))
 
     device = resolve_device(str(train_cfg["device"]))
     output_dir, run_name = resolve_train_output_dir(train_cfg)
 
-    abs_file = Path(cfg["data"]["abs_file"])
     rel_file = Path(cfg["data"]["rel_file"])
-    feature385_file = Path(cfg["data"]["feature385_file"]) if "feature385_file" in cfg["data"] else None
+    abs_file = Path(cfg["data"].get("abs_file", ""))
+    feature_file = Path(
+        cfg["data"].get(
+            "feature_file",
+            cfg["data"].get("feature193_file", cfg["data"].get("feature190_file", "")),
+        )
+    )
     target_file = Path(cfg["data"]["target_file"])
     train_split = Path(cfg["data"]["train_split"])
     val_split = Path(cfg["data"]["val_split"])
+    feature_mode = str(cfg.get("feature_mode", "REL190")).upper()
+    model_name = str(cfg.get("model_name", "B1vnextREL190"))
+    region_input_dims = get_region_input_dims(feature_mode)
 
     print(f"[INFO] device={device}")
+    print(f"[INFO] feature_mode={feature_mode}")
+    print(f"[INFO] model_name={model_name}")
     if run_name is not None:
         print(f"[INFO] run_name={run_name}")
     print(f"[INFO] output_dir={output_dir}")
+    print(f"[INFO] region_dims={region_input_dims}")
     print(
         "[INFO] boundary "
         f"lo={boundary_cfg['lo']} hi={boundary_cfg['hi']} "
@@ -213,29 +217,31 @@ def main() -> None:
     print("[INFO] loading target map...")
     target_map = load_target30_map(target_file)
 
-    print("[INFO] building train/val arrays from ABS+REL+Pose...")
-    if feature385_file is not None and feature385_file.exists():
-        print(f"[INFO] using feature385_file={feature385_file}")
+    print(f"[INFO] building train/val arrays from {feature_mode}...")
+    if feature_file and feature_file.exists():
+        print(f"[INFO] using feature_file={feature_file}")
     else:
-        print(f"[INFO] using abs_file={abs_file} rel_file={rel_file}")
+        print(f"[INFO] feature file missing, fallback to rel raw columns: {rel_file}")
 
     x_train, y_train = build_region_inputs_from_split(
         train_split,
         abs_file=abs_file,
         rel_file=rel_file,
         target30_map=target_map,
-        feature385_file=feature385_file,
+        feature_file=feature_file if feature_file and feature_file.exists() else None,
+        feature_mode=feature_mode,
     )
     x_val, y_val = build_region_inputs_from_split(
         val_split,
         abs_file=abs_file,
         rel_file=rel_file,
         target30_map=target_map,
-        feature385_file=feature385_file,
+        feature_file=feature_file if feature_file and feature_file.exists() else None,
+        feature_mode=feature_mode,
     )
     print(
         f"[INFO] train={y_train.shape} val={y_val.shape} "
-        f"feature385={sum(v.shape[1] for v in x_train.values())}"
+        f"feature_dim_total={sum(v.shape[1] for v in x_train.values())}"
     )
 
     region_indices = load_motor_region_indices(metrics_cfg=cfg.get("metrics", {}), dim=int(y_train.shape[1]))
@@ -266,13 +272,22 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = MotorRegressorMLP().to(device)
+    model = build_model_from_config(cfg).to(device)
+    print(f"[INFO] latent_dim={int(getattr(model, 'latent_dim', -1))}")
+    print(f"[INFO] brow_residual_input_dim={int(getattr(model, 'brow_residual_input_dim', -1))}")
+    print(f"[INFO] mouth_residual_input_dim={int(getattr(model, 'mouth_residual_input_dim', -1))}")
+    print(f"[INFO] alpha_b_init={float(model.alpha_b.item()):.4f} alpha_m_init={float(model.alpha_m.item()):.4f}")
     ema = ModelEMA(model, beta=ema_decay)
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(train_cfg["lr"]))
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(train_cfg["lr"]),
+        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
+    )
 
     epochs = int(train_cfg["epochs"])
-    patience = int(train_cfg["early_stopping"]["patience"])
-    min_delta = float(train_cfg["early_stopping"]["min_delta"])
+    train_early_cfg = train_cfg.get("early_stopping", {}) if isinstance(train_cfg.get("early_stopping", {}), Mapping) else {}
+    patience = int(train_early_cfg.get("patience", early_cfg.get("patience", 80)))
+    min_delta = float(train_early_cfg.get("min_delta", early_cfg.get("min_delta", 1.0e-6)))
 
     best_val = float("inf")
     best_epoch = -1
@@ -294,6 +309,8 @@ def main() -> None:
                 "train_jaw_loss",
                 "train_mouth_loss",
                 "val_mae",
+                "alpha_b",
+                "alpha_m",
             ]
         )
 
@@ -367,6 +384,8 @@ def main() -> None:
                     train_region_losses["jaw"],
                     train_region_losses["mouth"],
                     val_mae,
+                    float(model.alpha_b.item()),
+                    float(model.alpha_m.item()),
                 ]
             )
             f_hist.flush()
@@ -400,6 +419,8 @@ def main() -> None:
                 f"eye={train_region_losses['eye']:.6f} "
                 f"jaw={train_region_losses['jaw']:.6f} "
                 f"mouth={train_region_losses['mouth']:.6f} "
+                f"alpha_b={float(model.alpha_b.item()):.4f} "
+                f"alpha_m={float(model.alpha_m.item()):.4f} "
                 f"val_mae={val_mae:.6f} best={best_val:.6f}"
             )
 
@@ -423,6 +444,7 @@ def main() -> None:
     )
 
     summary = {
+        "feature_mode": feature_mode,
         "best_val_mae": best_val,
         "best_epoch": best_epoch,
         "elapsed_sec": elapsed,
@@ -430,10 +452,14 @@ def main() -> None:
         "train_samples": int(y_train.shape[0]),
         "val_samples": int(y_val.shape[0]),
         "feature_dim_total": int(sum(v.shape[1] for v in x_train.values())),
+        "model_name": model_name,
+        "latent_dim": int(getattr(model, "latent_dim", -1)),
+        "region_input_dims": region_input_dims,
         "run_name": run_name,
         "output_dir": str(output_dir),
         "boundary_train_cfg": boundary_cfg,
         "region_loss_weights": region_weights,
+        "alpha": {"alpha_b": float(model.alpha_b.item()), "alpha_m": float(model.alpha_m.item())},
         "ema": {"enabled": True, "decay": ema_decay, "used_for_val": use_ema_for_val},
         "early_stopping": {
             "patience": patience,

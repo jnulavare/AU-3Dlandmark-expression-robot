@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Explainability entry for regional model.
+"""Explainability entry for REL190 / REL193-Context B1vnext models.
 
-Outputs keep the original artifact names while latent now comes from model-internal z24.
+Outputs keep the original artifact names while latent comes from model-internal z24.
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ import yaml
 
 from data_utils import build_region_inputs_from_split, load_target30_map
 from eval_metrics import load_motor_names, load_motor_region_indices
-from model import MotorRegressorMLP
+from model import build_model_from_config
 from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
-DEFAULT_LATENT_REGION_INDICES: Dict[str, List[int]] = {
+DEFAULT_LATENT_REGION_INDICES_24: Dict[str, List[int]] = {
     "brow": [0, 1, 2, 3],
     "eye": [4, 5, 6, 7],
     "mouth": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
@@ -29,10 +29,15 @@ DEFAULT_LATENT_REGION_INDICES: Dict[str, List[int]] = {
     "global": [22, 23],
 }
 
+DEFAULT_LATENT_REGION_INDICES_26: Dict[str, List[int]] = {
+    **DEFAULT_LATENT_REGION_INDICES_24,
+    "pose": [24, 25],
+}
+
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Explainability analysis based on model z24 and motor30.")
-    p.add_argument("--config", type=Path, default=Path("configs/baseline.yaml"))
+    p = argparse.ArgumentParser(description="Explainability analysis based on model latent and motor30.")
+    p.add_argument("--config", type=Path, default=Path("configs/b1vnext_rel193_context.yaml"))
     p.add_argument("--ckpt", type=Path, default=None, help="Override config.eval and use explicit checkpoint path")
     p.add_argument(
         "--split",
@@ -63,7 +68,10 @@ def load_latent_region_indices(explain_cfg: Mapping[str, object] | None, dim: in
     if isinstance(region_cfg, Mapping):
         region_map = {str(k): _to_index_list(v) for k, v in region_cfg.items()}
     else:
-        region_map = {k: list(v) for k, v in DEFAULT_LATENT_REGION_INDICES.items()}
+        if dim == 26:
+            region_map = {k: list(v) for k, v in DEFAULT_LATENT_REGION_INDICES_26.items()}
+        else:
+            region_map = {k: list(v) for k, v in DEFAULT_LATENT_REGION_INDICES_24.items()}
 
     for region, idxs in region_map.items():
         if len(idxs) == 0:
@@ -161,7 +169,6 @@ def _encode_latent_batches(
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
-    # Extract z24 from encoder path only (without motor head forward).
     latents: List[np.ndarray] = []
     n = int(next(iter(x.values())).shape[0])
     model.eval()
@@ -169,7 +176,13 @@ def _encode_latent_batches(
         for s in range(0, n, batch_size):
             e = min(s + batch_size, n)
             xb = {k: torch.from_numpy(v[s:e]).to(device=device, dtype=torch.float32) for k, v in x.items()}
-            z = model.encode(xb)["latent24"].detach().cpu().numpy()
+            enc = model.encode(xb)
+            if "latent" in enc:
+                z = enc["latent"].detach().cpu().numpy()
+            elif "latent26" in enc:
+                z = enc["latent26"].detach().cpu().numpy()
+            else:
+                z = enc["latent24"].detach().cpu().numpy()
             latents.append(z)
     return np.vstack(latents).astype(np.float64)
 
@@ -199,7 +212,6 @@ def perturbation_sensitivity_analysis(
     random_seed: int,
     top_k: int,
 ) -> Dict[str, object]:
-    # Region-wise zeroing/noise perturbation is done in z-space, then passed to shared motor head.
     base_pred = _predict_from_latent_batches(model, z, device=device, batch_size=batch_size)
 
     rng = np.random.default_rng(random_seed)
@@ -241,7 +253,7 @@ def perturbation_sensitivity_analysis(
     return out
 
 
-def save_corr_heatmap_png(corr: np.ndarray, out_png: Path) -> bool:
+def save_corr_heatmap_png(corr: np.ndarray, out_png: Path, latent_dim: int) -> bool:
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -250,7 +262,7 @@ def save_corr_heatmap_png(corr: np.ndarray, out_png: Path) -> bool:
     fig = plt.figure(figsize=(12, 7))
     ax = fig.add_subplot(111)
     im = ax.imshow(corr, aspect="auto", cmap="coolwarm", vmin=-1.0, vmax=1.0)
-    ax.set_title("Latent24 vs Motor30 Correlation")
+    ax.set_title(f"Latent{latent_dim} vs Motor30 Correlation")
     ax.set_xlabel("motor index")
     ax.set_ylabel("latent index")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -293,16 +305,28 @@ def main() -> None:
 
     split_path = resolve_split_path(data_cfg, split)
     target_map = load_target30_map(Path(str(data_cfg["target_file"])))
-    feature385_file = Path(str(data_cfg["feature385_file"])) if "feature385_file" in data_cfg else None
+    rel_file = Path(str(data_cfg["rel_file"]))
+    abs_file = Path(str(data_cfg.get("abs_file", "")))
+    feature_mode = str(cfg.get("feature_mode", "REL190")).upper()
+    model_name = str(cfg.get("model_name", "B1vnextREL190"))
+    feature_file = Path(
+        str(
+            data_cfg.get(
+                "feature_file",
+                data_cfg.get("feature193_file", data_cfg.get("feature190_file", "")),
+            )
+        )
+    )
     x, y = build_region_inputs_from_split(
         split_pkl=split_path,
-        abs_file=Path(str(data_cfg["abs_file"])),
-        rel_file=Path(str(data_cfg["rel_file"])),
+        abs_file=abs_file,
+        rel_file=rel_file,
         target30_map=target_map,
-        feature385_file=feature385_file,
+        feature_file=feature_file if feature_file and feature_file.exists() else None,
+        feature_mode=feature_mode,
     )
 
-    model = MotorRegressorMLP().to(device)
+    model = build_model_from_config(cfg).to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     use_ema = bool(eval_cfg.get("use_ema", True))
     model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
@@ -349,7 +373,7 @@ def main() -> None:
     sens_json.write_text(json.dumps(sens, ensure_ascii=False, indent=2), encoding="utf-8")
 
     heatmap_png = run_dir / "latent_motor_corr_heatmap.png"
-    heatmap_ok = save_corr_heatmap_png(corr_lm, heatmap_png)
+    heatmap_ok = save_corr_heatmap_png(corr_lm, heatmap_png, latent_dim=int(z.shape[1]))
 
     summary = {
         "split": split,
@@ -357,6 +381,8 @@ def main() -> None:
         "latent_dim": int(z.shape[1]),
         "motor_dim": int(y.shape[1]),
         "device": str(device),
+        "feature_mode": feature_mode,
+        "model_name": model_name,
         "ckpt": str(ckpt_path),
         "run_name": run_name,
         "split_path": str(split_path),

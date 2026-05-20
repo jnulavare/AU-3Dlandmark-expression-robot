@@ -11,3 +11,6 @@ residual scale方案，原来是： y=ybase+Δybrow+Δymouth，
 现在是y=ybase+αbΔybrow+αmΔymouth，
 alpha_b, alpha_m 是可学习标量 初值设为 1.0。让模型自己学修正强度
 使用SmoothL1  EMA使用。
+Compare7(B1vnext-REL):考虑到训练模型时候是采集机器人脸进行数据集处理，
+而实际运行时候是通过真实人脸进行输入，故放弃ABS即绝对值相关数据收集，采取
+只使用REL作为特征提取内容，观察是否对原方式有所提升。
