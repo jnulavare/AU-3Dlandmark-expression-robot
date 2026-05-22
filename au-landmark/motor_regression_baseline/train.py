@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from data_utils import RegionalInputDataset, build_region_inputs_from_split, load_target30_map
 from eval_metrics import load_motor_region_indices
-from model import build_model_from_config
+from model import MotorRegressorMLP
 from run_utils import resolve_train_output_dir
 
 
@@ -82,14 +82,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def set_seed(seed: int, deterministic: bool = True) -> None:
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    if torch.backends.cudnn.is_available():
-        torch.backends.cudnn.deterministic = bool(deterministic)
-        torch.backends.cudnn.benchmark = not bool(deterministic)
 
 
 def resolve_device(device_cfg: str) -> torch.device:
@@ -100,17 +97,6 @@ def resolve_device(device_cfg: str) -> torch.device:
 
 def move_inputs_to_device(x: dict, device: torch.device) -> dict:
     return {k: v.to(device, non_blocking=True) for k, v in x.items()}
-
-
-def _model_meta(model: torch.nn.Module) -> dict:
-    return {
-        "model_name": str(getattr(model, "model_name", model.__class__.__name__)),
-        "latent_dim": int(getattr(model, "latent_dim", -1)),
-        "brow_residual_input_dim": int(getattr(model, "brow_residual_input_dim", -1)),
-        "mouth_residual_input_dim": int(getattr(model, "mouth_residual_input_dim", -1)),
-        "nose_residual_input_dim": int(getattr(model, "nose_residual_input_dim", 0)),
-        "nose_residual_enabled": bool(getattr(model, "nose_residual_enabled", False)),
-    }
 
 
 def compute_boundary_loss_torch(pred: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
@@ -124,13 +110,13 @@ def compute_weighted_smooth_l1_task_loss(
     region_weights: Mapping[str, float],
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     per_region: Dict[str, torch.Tensor] = {}
-    task_loss = pred.new_tensor(0.0)
+    total = pred.new_tensor(0.0)
     for region in ("brow", "eye", "jaw", "mouth"):
         idx = region_indices_t[region]
         loss_r = F.smooth_l1_loss(pred.index_select(1, idx), target.index_select(1, idx), reduction="mean")
         per_region[region] = loss_r
-        task_loss = task_loss + float(region_weights.get(region, 1.0)) * loss_r
-    return task_loss, per_region
+        total = total + float(region_weights.get(region, 1.0)) * loss_r
+    return total, per_region
 
 
 def evaluate_mae(
@@ -182,11 +168,8 @@ def main() -> None:
     args = parse_args()
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
-    seed = int(cfg.get("seed", cfg.get("train", {}).get("seed", 42)))
-    deterministic = True
-    set_seed(seed, deterministic=deterministic)
-    cfg["seed"] = seed
-    cfg.setdefault("train", {})["seed"] = seed
+    seed = int(cfg["train"]["seed"])
+    set_seed(seed)
     boundary_cfg = resolve_boundary_train_cfg(cfg)
     region_weights = resolve_region_loss_weights(cfg)
 
@@ -206,7 +189,6 @@ def main() -> None:
     val_split = Path(cfg["data"]["val_split"])
 
     print(f"[INFO] device={device}")
-    print(f"[INFO] Using random seed: {seed}")
     if run_name is not None:
         print(f"[INFO] run_name={run_name}")
     print(f"[INFO] output_dir={output_dir}")
@@ -223,8 +205,6 @@ def main() -> None:
         f"brow={region_weights['brow']} eye={region_weights['eye']} "
         f"jaw={region_weights['jaw']} mouth={region_weights['mouth']}"
     )
-    print(f"[INFO] model_name={str(cfg.get('model_name', 'B1vnext'))}")
-    print(f"[INFO] feature_mode={str(cfg.get('feature_mode', 'FEATURE385'))}")
     print(
         f"[INFO] ema_decay={ema_decay} use_ema_for_val={use_ema_for_val} "
         f"min_epochs_before_early_stop={min_epochs_before_early_stop}"
@@ -265,7 +245,6 @@ def main() -> None:
     region_indices_t = {
         k: torch.tensor(v, dtype=torch.long, device=device) for k, v in region_indices.items() if k in {"brow", "eye", "jaw", "mouth"}
     }
-    print(f"[INFO] feature_dim_total={int(sum(v.shape[1] for v in x_train.values()))}")
 
     train_ds = RegionalInputDataset(x_train, y_train)
     val_ds = RegionalInputDataset(x_val, y_val)
@@ -287,35 +266,9 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = build_model_from_config(cfg).to(device)
-    meta = _model_meta(model)
-    print(
-        "[INFO] model_meta "
-        f"name={meta['model_name']} latent_dim={meta['latent_dim']} "
-        f"brow_residual_input_dim={meta['brow_residual_input_dim']} "
-        f"mouth_residual_input_dim={meta['mouth_residual_input_dim']} "
-        f"nose_residual_input_dim={meta['nose_residual_input_dim']} "
-        f"nose_residual_enabled={meta['nose_residual_enabled']}"
-    )
-    if hasattr(model, "alpha_n"):
-        print(
-            "[INFO] alpha_init "
-            f"alpha_b={float(getattr(model, 'alpha_b').item()):.4f} "
-            f"alpha_m={float(getattr(model, 'alpha_m').item()):.4f} "
-            f"alpha_n={float(getattr(model, 'alpha_n').item()):.4f}"
-        )
-    else:
-        print(
-            "[INFO] alpha_init "
-            f"alpha_b={float(getattr(model, 'alpha_b').item()):.4f} "
-            f"alpha_m={float(getattr(model, 'alpha_m').item()):.4f}"
-        )
+    model = MotorRegressorMLP().to(device)
     ema = ModelEMA(model, beta=ema_decay)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(train_cfg["lr"]),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(train_cfg["lr"]))
 
     epochs = int(train_cfg["epochs"])
     patience = int(train_cfg["early_stopping"]["patience"])
@@ -341,8 +294,6 @@ def main() -> None:
                 "train_jaw_loss",
                 "train_mouth_loss",
                 "val_mae",
-                "alpha_b",
-                "alpha_m",
             ]
         )
 
@@ -416,8 +367,6 @@ def main() -> None:
                     train_region_losses["jaw"],
                     train_region_losses["mouth"],
                     val_mae,
-                    float(getattr(model, "alpha_b").item()),
-                    float(getattr(model, "alpha_m").item()),
                 ]
             )
             f_hist.flush()
@@ -442,7 +391,7 @@ def main() -> None:
             else:
                 bad_epochs += 1
 
-            msg = (
+            print(
                 f"[EPOCH {epoch:03d}] "
                 f"task={train_task_loss:.6f} "
                 f"boundary={train_boundary_loss:.6f} "
@@ -451,11 +400,8 @@ def main() -> None:
                 f"eye={train_region_losses['eye']:.6f} "
                 f"jaw={train_region_losses['jaw']:.6f} "
                 f"mouth={train_region_losses['mouth']:.6f} "
-                f"alpha_b={float(getattr(model, 'alpha_b').item()):.4f} "
-                f"alpha_m={float(getattr(model, 'alpha_m').item()):.4f} "
+                f"val_mae={val_mae:.6f} best={best_val:.6f}"
             )
-            msg += f"val_mae={val_mae:.6f} best={best_val:.6f}"
-            print(msg)
 
             if epoch >= min_epochs_before_early_stop and bad_epochs >= patience:
                 print(f"[INFO] early stopping at epoch={epoch}, best_epoch={best_epoch}")
@@ -477,10 +423,6 @@ def main() -> None:
     )
 
     summary = {
-        "model_name": meta["model_name"],
-        "latent_dim": meta["latent_dim"],
-        "seed": seed,
-        "deterministic": deterministic,
         "best_val_mae": best_val,
         "best_epoch": best_epoch,
         "elapsed_sec": elapsed,
@@ -492,16 +434,6 @@ def main() -> None:
         "output_dir": str(output_dir),
         "boundary_train_cfg": boundary_cfg,
         "region_loss_weights": region_weights,
-        "residual_heads": {
-            "brow_residual_input_dim": meta["brow_residual_input_dim"],
-            "mouth_residual_input_dim": meta["mouth_residual_input_dim"],
-            "nose_residual_input_dim": meta["nose_residual_input_dim"],
-            "nose_residual_enabled": meta["nose_residual_enabled"],
-        },
-        "alpha": {
-            "alpha_b": float(getattr(model, "alpha_b").item()),
-            "alpha_m": float(getattr(model, "alpha_m").item()),
-        },
         "ema": {"enabled": True, "decay": ema_decay, "used_for_val": use_ema_for_val},
         "early_stopping": {
             "patience": patience,

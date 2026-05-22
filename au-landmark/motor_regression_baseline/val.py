@@ -23,7 +23,7 @@ from eval_metrics import (
     load_motor_names,
     load_motor_region_indices,
 )
-from model import build_model_from_config
+from model import MotorRegressorMLP
 from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
@@ -108,7 +108,7 @@ def main() -> None:
     )
 
     # 2) 加载 checkpoint 并做整集推理。
-    model = build_model_from_config(cfg).to(device)
+    model = MotorRegressorMLP().to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     use_ema = _as_bool(eval_cfg.get("use_ema", True), default=True)
     model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
@@ -173,14 +173,9 @@ def main() -> None:
     metrics = {
         "split": "val",
         **metric_dict,
-        "seed": int(cfg.get("seed", cfg.get("train", {}).get("seed", 42))),
         "ckpt": str(ckpt_path),
         "run_name": run_name,
-        "run_dir": str(output_dir),
         "device": str(device),
-        "model_name": str(getattr(model, "model_name", cfg.get("model_name", model.__class__.__name__))),
-        "alpha_b": float(getattr(model, "alpha_b").item()),
-        "alpha_m": float(getattr(model, "alpha_m").item()),
         "region_indices": region_indices,
         "motor_names": motor_names,
     }

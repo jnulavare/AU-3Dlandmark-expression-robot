@@ -17,7 +17,7 @@ import yaml
 
 from data_utils import build_region_inputs_from_split, load_target30_map
 from eval_metrics import load_motor_names, load_motor_region_indices
-from model import build_model_from_config
+from model import MotorRegressorMLP
 from run_utils import resolve_eval_ckpt_path, select_eval_state_dict
 
 
@@ -153,93 +153,6 @@ def _predict_from_latent_batches(
             yb = model.forward_from_latent(zb).detach().cpu().numpy()
             preds.append(yb)
     return np.vstack(preds).astype(np.float64)
-
-
-def _residual_head_contribution(
-    model: torch.nn.Module,
-    x: Mapping[str, np.ndarray],
-    device: torch.device,
-    batch_size: int,
-) -> Dict[str, object] | None:
-    if not hasattr(model, "forward"):
-        return None
-    if not hasattr(model, "alpha_b") or not hasattr(model, "alpha_m"):
-        return None
-
-    n = int(next(iter(x.values())).shape[0])
-    base_abs_acc = None
-    brow_abs_acc = 0.0
-    mouth_abs_acc = 0.0
-    nose_abs_acc = 0.0
-    motor29_base_abs_acc = 0.0
-    motor29_mouth_abs_acc = 0.0
-    motor29_nose_abs_acc = 0.0
-    seen = 0
-
-    model.eval()
-    with torch.inference_mode():
-        for s in range(0, n, batch_size):
-            e = min(s + batch_size, n)
-            xb = {k: torch.from_numpy(v[s:e]).to(device=device, dtype=torch.float32) for k, v in x.items()}
-            out = model(xb, return_parts=True)
-            if not isinstance(out, tuple) or len(out) != 2:
-                return None
-            _, parts = out
-            if not isinstance(parts, Mapping):
-                return None
-            if "y_base" not in parts or "delta_brow" not in parts or "delta_mouth" not in parts:
-                return None
-
-            y_base = parts["y_base"].detach()
-            delta_brow = parts["delta_brow"].detach()
-            delta_mouth = parts["delta_mouth"].detach()
-            alpha_b = float(parts["alpha_b"].detach().item()) if "alpha_b" in parts else float(model.alpha_b.item())
-            alpha_m = float(parts["alpha_m"].detach().item()) if "alpha_m" in parts else float(model.alpha_m.item())
-
-            # mouth output layout is [15..26,29], so motor29 is at index 12.
-            mouth29_idx = 12 if int(delta_mouth.shape[1]) >= 13 else int(delta_mouth.shape[1] - 1)
-
-            y_base_abs = torch.abs(y_base).sum(dim=0).cpu().numpy()
-            if base_abs_acc is None:
-                base_abs_acc = y_base_abs
-            else:
-                base_abs_acc += y_base_abs
-
-            brow_abs_acc += float(torch.abs(alpha_b * delta_brow).sum().item())
-            mouth_abs_acc += float(torch.abs(alpha_m * delta_mouth).sum().item())
-            motor29_base_abs_acc += float(torch.abs(y_base[:, 29]).sum().item())
-            motor29_mouth_abs_acc += float(torch.abs(alpha_m * delta_mouth[:, mouth29_idx]).sum().item())
-
-            if "delta_nose" in parts and "alpha_n" in parts:
-                alpha_n = float(parts["alpha_n"].detach().item())
-                delta_nose = parts["delta_nose"].detach().view(-1)
-                nose_abs_acc += float(torch.abs(alpha_n * delta_nose).sum().item())
-                motor29_nose_abs_acc += float(torch.abs(alpha_n * delta_nose).sum().item())
-            else:
-                alpha_n = float(getattr(model, "alpha_n").item()) if hasattr(model, "alpha_n") else 0.0
-
-            seen += int(e - s)
-
-    if seen <= 0 or base_abs_acc is None:
-        return None
-
-    base_mean_abs_per_motor = (base_abs_acc / float(seen)).tolist()
-    brow_count = float(seen * 4)
-    mouth_count = float(seen * 13)
-    nose_count = float(max(seen, 1))
-
-    return {
-        "alpha_b": float(getattr(model, "alpha_b").item()),
-        "alpha_m": float(getattr(model, "alpha_m").item()),
-        "alpha_n": float(getattr(model, "alpha_n").item()) if hasattr(model, "alpha_n") else 0.0,
-        "mean_abs_base_output_per_motor": [float(v) for v in base_mean_abs_per_motor],
-        "mean_abs_brow_residual_on_brow_motors": float(brow_abs_acc / brow_count),
-        "mean_abs_mouth_residual_on_mouth_motors": float(mouth_abs_acc / mouth_count),
-        "mean_abs_nose_residual_on_motor29": float(motor29_nose_abs_acc / nose_count),
-        "motor29_base_mean_abs": float(motor29_base_abs_acc / nose_count),
-        "motor29_mouth_residual_mean_abs": float(motor29_mouth_abs_acc / nose_count),
-        "motor29_nose_residual_mean_abs": float(motor29_nose_abs_acc / nose_count),
-    }
 
 
 def _encode_latent_batches(
@@ -389,7 +302,7 @@ def main() -> None:
         feature385_file=feature385_file,
     )
 
-    model = build_model_from_config(cfg).to(device)
+    model = MotorRegressorMLP().to(device)
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     use_ema = bool(eval_cfg.get("use_ema", True))
     model.load_state_dict(select_eval_state_dict(ckpt, use_ema=use_ema))
@@ -429,21 +342,11 @@ def main() -> None:
     region_json = run_dir / "region_corr_stats.json"
     sens_json = run_dir / "perturbation_sensitivity.json"
     summary_json = run_dir / "explainability_summary.json"
-    residual_json = run_dir / "residual_head_contribution.json"
 
     np.save(corr_npy, corr_lm)
     np.savetxt(corr_csv, corr_lm, delimiter=",", fmt="%.8f")
     region_json.write_text(json.dumps(region_corr, ensure_ascii=False, indent=2), encoding="utf-8")
     sens_json.write_text(json.dumps(sens, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    residual_contrib = _residual_head_contribution(
-        model=model,
-        x=x,
-        device=device,
-        batch_size=int(train_cfg.get("batch_size", 256)),
-    )
-    if residual_contrib is not None:
-        residual_json.write_text(json.dumps(residual_contrib, ensure_ascii=False, indent=2), encoding="utf-8")
 
     heatmap_png = run_dir / "latent_motor_corr_heatmap.png"
     heatmap_ok = save_corr_heatmap_png(corr_lm, heatmap_png)
@@ -454,7 +357,6 @@ def main() -> None:
         "latent_dim": int(z.shape[1]),
         "motor_dim": int(y.shape[1]),
         "device": str(device),
-        "model_name": str(getattr(model, "model_name", cfg.get("model_name", model.__class__.__name__))),
         "ckpt": str(ckpt_path),
         "run_name": run_name,
         "split_path": str(split_path),
@@ -465,7 +367,6 @@ def main() -> None:
             "corr_npy": str(corr_npy),
             "region_corr_stats": str(region_json),
             "perturbation_sensitivity": str(sens_json),
-            "residual_head_contribution": str(residual_json) if residual_contrib is not None else None,
             "corr_heatmap_png": str(heatmap_png) if heatmap_ok else None,
         },
         "heatmap_saved": bool(heatmap_ok),

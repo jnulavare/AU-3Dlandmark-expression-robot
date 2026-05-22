@@ -268,7 +268,6 @@ def main() -> None:
 
         cfg_seed = copy.deepcopy(cfg)
         cfg_seed["seed"] = int(seed)
-        cfg_seed["run_name"] = f"{run_name_prefix}_{seed}"
         cfg_seed.setdefault("train", {})["seed"] = int(seed)
         cfg_seed["train"]["output_dir"] = str(seed_dir)
         cfg_seed["train"]["use_run_subdir"] = False
@@ -327,7 +326,7 @@ def main() -> None:
         summary = _read_json(json_path)
         print("Multi-seed summary:")
         test_mae_stats = summary.get("test_mae", {})
-        print(f"test_mae mean ± std = {test_mae_stats.get('mean')} ± {test_mae_stats.get('std')}")
+        print(f"test_mae mean +/- std = {test_mae_stats.get('mean')} +/- {test_mae_stats.get('std')}")
         print(f"best seed (test_mae) = {summary.get('best_seed_by_test_mae')}")
         print(f"summary csv = {csv_path}")
         print(f"summary json = {json_path}")
