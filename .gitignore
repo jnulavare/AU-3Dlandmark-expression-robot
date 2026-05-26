@@ -9,6 +9,9 @@ __pycache__/
 # data
 dataset/
 
+# assets
+assets/
+
 # junk
 *.log
 *.tmp
