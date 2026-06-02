@@ -23,12 +23,20 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import numpy as np
+from feature385_builder import (
+    FEATURE_LAYOUT,
+    FEATURE385_PACK_ORDER,
+    feature385_to_internal_abs_rel_pose,
+    load_feature_columns,
+    row_to_compare6_feature385,
+)
 
 
 # Default paths (edit directly if needed).
-ROBOT_NEUTRAL_IMAGE = r"D:/code/AU+landmark/au-landmark/assets/ameca_neutral.jpg"
+ROBOT_NEUTRAL_IMAGE = r"D:/code/AU+landmark/au-landmark/assets/20000.jpg"
 OUTPUT_JSON = r"D:/code/AU+landmark/au-landmark/assets/robot_neutral_feature.json"
 OUTPUT_NPY = r""
+TRAIN_FEATURE_COLUMNS_JSON = r"D:/code/AU+landmark/dataset/normalize/FEATURE385_X2C_gpu.columns.json"
 DEVICE = "cuda"
 DETECTOR = "sfd"
 TORCH_HOME = r"D:/torch_cache"
@@ -37,90 +45,16 @@ ABS_DIM = 192
 REL_DIM = 190
 POSE_DIM = 3
 FEATURE_DIM_TOTAL = 385
-FEATURE_LAYOUT = "compare6_interleaved"
-FEATURE385_PACK_ORDER = (
-    "brow_abs,brow_rel,eye_abs,eye_rel,mouth_abs,mouth_rel,"
-    "jaw_abs,jaw_rel,global_abs,global_rel,pose"
-)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build robot_neutral_feature.json from one image")
     p.add_argument("--image", type=str, default=ROBOT_NEUTRAL_IMAGE, help="Robot neutral image path")
     p.add_argument("--output-json", type=str, default=OUTPUT_JSON, help="Output robot_neutral_feature.json")
     p.add_argument("--output-npy", type=str, default=OUTPUT_NPY, help="Optional output .npy for feature385")
+    p.add_argument("--columns-json", type=str, default=TRAIN_FEATURE_COLUMNS_JSON, help="FEATURE385 columns json path")
     p.add_argument("--device", type=str, default=DEVICE, help="cuda or cpu")
     p.add_argument("--detector", type=str, default=DETECTOR, help="face-alignment detector backend")
     p.add_argument("--torch-home", type=str, default=TORCH_HOME, help="Torch cache directory")
     return p.parse_args()
-
-
-def pack_feature385_interleaved(abs_vec: np.ndarray, rel_vec: np.ndarray, pose_vec: np.ndarray) -> np.ndarray:
-    abs_arr = np.asarray(abs_vec, dtype=np.float32).reshape(-1)
-    rel_arr = np.asarray(rel_vec, dtype=np.float32).reshape(-1)
-    pose_arr = np.asarray(pose_vec, dtype=np.float32).reshape(-1)
-    if abs_arr.shape[0] != 192:
-        raise ValueError(f"abs_vec must be 192, got {abs_arr.shape[0]}")
-    if rel_arr.shape[0] != 190:
-        raise ValueError(f"rel_vec must be 190, got {rel_arr.shape[0]}")
-    if pose_arr.shape[0] != 3:
-        raise ValueError(f"pose_vec must be 3, got {pose_arr.shape[0]}")
-
-    feature385 = np.concatenate(
-        [
-            abs_arr[0:37],      # brow_abs
-            rel_arr[0:37],      # brow_rel
-            abs_arr[37:82],     # eye_abs
-            rel_arr[37:82],     # eye_rel
-            abs_arr[82:161],    # mouth_abs
-            rel_arr[82:161],    # mouth_rel
-            abs_arr[161:189],   # jaw_abs
-            rel_arr[161:189],   # jaw_rel
-            abs_arr[189:192],   # global_abs
-            rel_arr[189:190],   # global_rel
-            pose_arr,           # pose
-        ],
-        axis=0,
-    ).astype(np.float32)
-    if feature385.shape[0] != 385:
-        raise ValueError(f"feature385 must be 385, got {feature385.shape[0]}")
-    return feature385
-
-
-def validate_feature385_interleaved(
-    feature385: np.ndarray,
-    abs_vec: np.ndarray,
-    rel_vec: np.ndarray,
-    pose_vec: np.ndarray,
-) -> None:
-    f = np.asarray(feature385, dtype=np.float32).reshape(-1)
-    a = np.asarray(abs_vec, dtype=np.float32).reshape(-1)
-    r = np.asarray(rel_vec, dtype=np.float32).reshape(-1)
-    p = np.asarray(pose_vec, dtype=np.float32).reshape(-1)
-    if f.shape[0] != 385:
-        raise ValueError(f"feature385 must be 385, got {f.shape[0]}")
-    if a.shape[0] != 192:
-        raise ValueError(f"abs_vec must be 192, got {a.shape[0]}")
-    if r.shape[0] != 190:
-        raise ValueError(f"rel_vec must be 190, got {r.shape[0]}")
-    if p.shape[0] != 3:
-        raise ValueError(f"pose_vec must be 3, got {p.shape[0]}")
-
-    checks = [
-        np.allclose(f[0:37], a[0:37]),
-        np.allclose(f[37:74], r[0:37]),
-        np.allclose(f[74:119], a[37:82]),
-        np.allclose(f[119:164], r[37:82]),
-        np.allclose(f[164:243], a[82:161]),
-        np.allclose(f[243:322], r[82:161]),
-        np.allclose(f[322:350], a[161:189]),
-        np.allclose(f[350:378], r[161:189]),
-        np.allclose(f[378:381], a[189:192]),
-        np.allclose(f[381:382], r[189:190]),
-        np.allclose(f[382:385], p),
-    ]
-    if not all(checks):
-        raise AssertionError("feature385 interleaved layout validation failed")
 
 
 def _import_abs_extractor(project_dir: Path):
@@ -178,30 +112,24 @@ def _extract_single_abs_row(
     return row
 
 
-def _row_to_feature(row: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _row_to_feature(
+    row: Dict[str, Any],
+    columns: list[dict[str, Any]],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     face_found = int(float(row.get("face_found", 0) or 0))
     if face_found != 1:
         raise RuntimeError(f"No valid face detected on neutral image. error={row.get('error', '')}")
 
-    abs_vec = np.array([float(row.get(f"abs_{i:03d}", 0.0)) for i in range(ABS_DIM)], dtype=np.float32)
-    if abs_vec.shape[0] != ABS_DIM:
-        raise RuntimeError(f"ABS dim mismatch: got {abs_vec.shape[0]}, expect {ABS_DIM}")
-
-    pose = np.array(
-        [
-            float(row.get("yaw", 0.0)),
-            float(row.get("pitch", 0.0)),
-            float(row.get("roll", 0.0)),
-        ],
-        dtype=np.float32,
-    )
-    rel_vec = np.zeros((REL_DIM,), dtype=np.float32)
-    feature385 = pack_feature385_interleaved(abs_vec, rel_vec, pose)
-    validate_feature385_interleaved(feature385, abs_vec, rel_vec, pose)
+    built = row_to_compare6_feature385(row=row, columns=columns, zero_rel=True)
+    feature385 = built["feature385"]
+    split = feature385_to_internal_abs_rel_pose(feature385)
+    abs_vec = split["abs"]
+    rel_vec = split["rel"]
+    pose = split["pose"]
     if feature385.shape[0] != FEATURE_DIM_TOTAL:
         raise RuntimeError(f"FEATURE385 dim mismatch: got {feature385.shape[0]}, expect {FEATURE_DIM_TOTAL}")
 
-    return abs_vec, rel_vec, pose, feature385
+    return abs_vec, rel_vec, pose, feature385, built
 
 
 def main() -> None:
@@ -215,6 +143,7 @@ def main() -> None:
 
     if not image_path.exists():
         raise FileNotFoundError(f"image not found: {image_path}")
+    columns = load_feature_columns(args.columns_json)
 
     row = _extract_single_abs_row(
         image_path=image_path,
@@ -222,17 +151,20 @@ def main() -> None:
         detector=str(args.detector),
         torch_home=Path(args.torch_home),
     )
-    abs_vec, rel_vec, pose, feature385 = _row_to_feature(row)
+    abs_vec, rel_vec, pose, feature385, built_meta = _row_to_feature(row, columns=columns)
     feature_layout_check_passed = True
-    validate_feature385_interleaved(feature385, abs_vec, rel_vec, pose)
 
     payload: Dict[str, Any] = {
         "image_path": str(image_path),
         "feature_dim_total": FEATURE_DIM_TOTAL,
         "feature_layout": FEATURE_LAYOUT,
         "feature385_pack_order": FEATURE385_PACK_ORDER,
+        "feature_build_method": "columns_json_source_column",
         "neutral_rel_is_zero": True,
         "feature_layout_check_passed": bool(feature_layout_check_passed),
+        "missing_columns": built_meta.get("missing_columns", []),
+        "num_missing_columns": int(len(built_meta.get("missing_columns", []))),
+        "rel_columns_filled_zero": bool(built_meta.get("rel_columns_filled_zero", True)),
         "abs": abs_vec.tolist(),
         "rel": rel_vec.tolist(),
         "pose": pose.tolist(),
@@ -254,6 +186,7 @@ def main() -> None:
         },
         "notes": [
             "neutral rel is initialized to zeros(190).",
+            "feature385 is built by columns_json source_column mapping.",
             "feature385 uses compare6_interleaved layout: [brow_abs,brow_rel,eye_abs,eye_rel,mouth_abs,mouth_rel,jaw_abs,jaw_rel,global_abs,global_rel,pose].",
             "This file is intended for HumanToRobotFeatureAdapter input.",
         ],

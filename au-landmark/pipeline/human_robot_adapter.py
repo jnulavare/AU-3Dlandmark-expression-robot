@@ -11,10 +11,14 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 import cv2
 import numpy as np
+try:
+    from pipeline.feature385_builder import load_feature_columns
+except ModuleNotFoundError:
+    from feature385_builder import load_feature_columns
 
 # compare6 FEATURE385 canonical layout (used in data_utils.py fast path):
 # [0:37]    brow_abs
@@ -153,6 +157,8 @@ class HumanToRobotFeatureAdapter:
 
         self._warnings: List[str] = []
         self._normalizer_stats: Dict[str, Any] = self._load_normalizer_stats()
+        self._columns_json_path: Optional[Path] = self._resolve_columns_json_path()
+        self._feature_columns = self._load_feature_columns_optional()
         self.robot_neutral: Dict[str, np.ndarray] = self.load_robot_neutral_feature()
         self._fa_model = None
         self._abs_mod = None
@@ -167,6 +173,9 @@ class HumanToRobotFeatureAdapter:
             "global_abs_kept_neutral": True,
         }
         self._last_abs_delta: np.ndarray | None = None
+        self._last_rel_missing_columns: List[str] = []
+        self._rel190_order_name: str = "unknown"
+        self._rel190_order_checked_by_columns_json: bool = bool(self._feature_columns)
 
     def _warn(self, msg: str) -> None:
         self._warnings.append(msg)
@@ -243,6 +252,36 @@ class HumanToRobotFeatureAdapter:
             return out
         self._warn(f"unsupported normalizer format: {p.suffix}")
         return {}
+
+    def _resolve_columns_json_path(self) -> Optional[Path]:
+        cfg = self.config if isinstance(self.config, Mapping) else {}
+        adapter_cfg = cfg.get("adapter", {}) if isinstance(cfg.get("adapter", {}), Mapping) else {}
+
+        candidates: List[Path] = []
+        v = adapter_cfg.get("feature_columns_json", None)
+        if v:
+            candidates.append(Path(str(v)))
+        v = cfg.get("feature_columns_json", None)
+        if v:
+            candidates.append(Path(str(v)))
+        feature_file = cfg.get("feature_file", None)
+        if feature_file:
+            candidates.append(Path(str(feature_file) + ".columns.json"))
+
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    def _load_feature_columns_optional(self) -> Optional[List[Dict[str, Any]]]:
+        if self._columns_json_path is None:
+            self._warn("feature columns json not found in config; REL190 order check fallback will be used.")
+            return None
+        try:
+            return load_feature_columns(self._columns_json_path)
+        except Exception as exc:
+            self._warn(f"failed to load feature columns json: {self._columns_json_path} ({exc})")
+            return None
 
     def _split_feature385(self, feature385: np.ndarray) -> Dict[str, np.ndarray]:
         f = _to_np_1d(feature385, "feature385")
@@ -556,16 +595,59 @@ class HumanToRobotFeatureAdapter:
         dist_exp = _to_np_1d(human_expr_feature["dist"], "human_expr.dist")
         if au_neu.shape != au_exp.shape or lmk_neu.shape != lmk_exp.shape or dist_neu.shape != dist_exp.shape:
             raise ValueError("neutral/expr normalized feature shapes are inconsistent.")
-        au_rel = au_exp - au_neu
-        lmk_rel = lmk_exp - lmk_neu
-        dist_rel = dist_exp - dist_neu
-        energy_rel = np.array([float(np.sum(np.abs(dist_rel)))], dtype=np.float32)
-        # REL190 order must match the training REL channel order used by Compare6/B1vnext.
-        # Here we follow preprocess/extract_rel_input_vec_gpu.py:
-        # [AU_rel(15), LMK_rel(150), DIST_rel(24), ENERGY_rel(1)].
-        rel190 = np.concatenate([au_rel, lmk_rel, dist_rel, energy_rel], axis=0).astype(np.float32)
+        au_rel = (au_exp - au_neu).astype(np.float32)
+        lmk_rel = (lmk_exp - lmk_neu).astype(np.float32)
+        dist_rel = (dist_exp - dist_neu).astype(np.float32)
+        energy_rel = float(np.sum(np.abs(dist_rel)))
+
+        # Build rel source-column map first, then pack REL190 by columns.json order when available.
+        au_names = list(self._abs_mod.AU_NAMES)
+        dist_names = list(self._abs_mod.DIST_NAMES)
+        rel_map: Dict[str, float] = {}
+        for i, au in enumerate(au_names):
+            rel_map[f"{au}_rel"] = float(au_rel[i])
+
+        lmk_rel_50x3 = lmk_rel.reshape(50, 3)
+        for i in range(50):
+            rel_map[f"lmk_rel_{i:02d}_x"] = float(lmk_rel_50x3[i, 0])
+            rel_map[f"lmk_rel_{i:02d}_y"] = float(lmk_rel_50x3[i, 1])
+            rel_map[f"lmk_rel_{i:02d}_z"] = float(lmk_rel_50x3[i, 2])
+
+        for i, dname in enumerate(dist_names):
+            rel_map[f"{dname}_rel"] = float(dist_rel[i])
+        rel_map["ENERGY_rel"] = float(energy_rel)
+
+        self._last_rel_missing_columns = []
+        if self._feature_columns:
+            rel_values: List[float] = []
+            for item in self._feature_columns:
+                if str(item.get("source", "")).strip().lower() != "rel":
+                    continue
+                source_col = str(item.get("source_column", "")).strip()
+                if source_col in rel_map:
+                    rel_values.append(float(rel_map[source_col]))
+                else:
+                    self._last_rel_missing_columns.append(source_col)
+                    rel_values.append(0.0)
+            rel190 = np.asarray(rel_values, dtype=np.float32)
+            if rel190.shape[0] != self.rel_dim:
+                raise RuntimeError(
+                    f"REL190 dim mismatch after columns-json packing: got {rel190.shape[0]}, expect {self.rel_dim}"
+                )
+            if self._last_rel_missing_columns:
+                self._warn(
+                    f"REL190 columns missing from rel_map, filled zeros: {len(self._last_rel_missing_columns)} columns"
+                )
+            self._rel190_order_name = "columns_json_rel_by_feat_idx"
+            self._rel190_order_checked_by_columns_json = True
+            return rel190
+
+        # Fallback (kept for robustness when columns json missing).
+        rel190 = np.concatenate([au_rel, lmk_rel, dist_rel, np.array([energy_rel], dtype=np.float32)], axis=0).astype(np.float32)
         if rel190.shape[0] != 190:
             raise RuntimeError(f"REL190 dim mismatch, got {rel190.shape[0]}")
+        self._rel190_order_name = "au_lmk_dist_energy_fallback"
+        self._rel190_order_checked_by_columns_json = False
         return rel190
 
     def normalize_human_rel(
@@ -810,7 +892,10 @@ class HumanToRobotFeatureAdapter:
             "robot_style_abs_max": float(np.max(robot_style_abs)),
             "feature_layout": FEATURE_LAYOUT_NAME,
             "feature385_pack_order": FEATURE385_PACK_ORDER,
-            "rel190_order": "au_lmk_dist_energy",
+            "rel190_order": self._rel190_order_name,
+            "rel190_order_checked_by_columns_json": bool(self._rel190_order_checked_by_columns_json),
+            "rel190_missing_columns": list(self._last_rel_missing_columns),
+            "feature_columns_json_path": None if self._columns_json_path is None else str(self._columns_json_path),
             "feature_layout_check_passed": bool(feature_layout_check_passed),
             "rel_to_abs_mapping_used": bool(self._last_mapping_info.get("rel_to_abs_mapping_used", False)),
             "rel_to_abs_mapping_type": str(self._last_mapping_info.get("rel_to_abs_mapping_type", "unknown")),

@@ -22,6 +22,7 @@ try:
         REL_DIM_DEFAULT,
         HumanToRobotFeatureAdapter,
     )
+    from pipeline.feature385_builder import split_feature385_to_model_inputs
     from motor_regression_baseline.model import MotorRegressorMLP
     from motor_regression_baseline.run_utils import select_eval_state_dict
 except ModuleNotFoundError:
@@ -37,17 +38,19 @@ except ModuleNotFoundError:
         REL_DIM_DEFAULT,
         HumanToRobotFeatureAdapter,
     )
+    from pipeline.feature385_builder import split_feature385_to_model_inputs
     from motor_regression_baseline.model import MotorRegressorMLP
     from motor_regression_baseline.run_utils import select_eval_state_dict
 
 
 # Default paths (edit these directly for quick testing).
 HUMAN_NEUTRAL_IMAGE = r"D:/code/AU+landmark/au-landmark/assets/test1.jpg"
-HUMAN_EXPR_IMAGE = r"D:/code/AU+landmark/au-landmark/assets/test2.png"
+HUMAN_EXPR_IMAGE = r"D:/code/AU+landmark/au-landmark/assets/test1.jpg"
 ROBOT_NEUTRAL_FEATURE = r"D:/code/AU+landmark/au-landmark/assets/robot_neutral_feature.json"
 FEATURE_NORMALIZER_PATH = r""
 B1VNEXT_CONFIG = r"D:/code/AU+landmark/au-landmark/motor_regression_baseline/configs/baseline.yaml"
 B1VNEXT_CKPT = r"D:/code/AU+landmark/dataset/motor_regression_compare6/run_002/best.pt"
+TRAIN_FEATURE_COLUMNS_JSON = r"D:/code/AU+landmark/dataset/normalize/FEATURE385_X2C_gpu.columns.json"
 OUTPUT_DIR = r"D:/code/AU+landmark/au-landmark/output"
 OUTPUT_JSON = "motor30_prediction.json"
 OUTPUT_CSV = "motor30_prediction.csv"
@@ -95,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--normalizer", type=str, default=FEATURE_NORMALIZER_PATH)
     p.add_argument("--config", type=str, default=B1VNEXT_CONFIG)
     p.add_argument("--ckpt", type=str, default=B1VNEXT_CKPT)
+    p.add_argument("--columns_json", type=str, default=TRAIN_FEATURE_COLUMNS_JSON)
     p.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
     p.add_argument("--device", type=str, default="")
     return p.parse_args()
@@ -117,25 +121,6 @@ def resolve_device(requested: str, cfg: Mapping[str, Any]) -> torch.device:
     if cfg_device.startswith("cuda") and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-def split_feature385_to_model_inputs(feature385: np.ndarray) -> Dict[str, np.ndarray]:
-    f = np.asarray(feature385, dtype=np.float32).reshape(-1)
-    if f.shape[0] != FEATURE_DIM_TOTAL_DEFAULT:
-        raise ValueError(f"feature dim mismatch: {f.shape[0]} vs {FEATURE_DIM_TOTAL_DEFAULT}")
-    return {
-        "brow_abs": f[0:37],
-        "brow_rel": f[37:74],
-        "eye_abs": f[74:119],
-        "eye_rel": f[119:164],
-        "mouth_abs": f[164:243],
-        "mouth_rel": f[243:322],
-        "jaw_abs": f[322:350],
-        "jaw_rel": f[350:378],
-        "global_abs": f[378:381],
-        "global_rel": f[381:382],
-        "pose": f[382:385],
-    }
 
 
 def build_model_input_tensor(feature385: np.ndarray, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -182,6 +167,10 @@ def main() -> None:
         raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
 
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg.setdefault("adapter", {})
+    cfg["adapter"]["feature_columns_json"] = args.columns_json
     device = resolve_device(args.device, cfg)
 
     adapter = HumanToRobotFeatureAdapter(

@@ -47,14 +47,14 @@ JAW_DIST = ["jaw_open", "chin_to_nose", "chin_to_upper_lip"]
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build FEATURE385 = (ABS+REL 382) + pose(3) into data_compare3.")
+    p = argparse.ArgumentParser(description="Build FEATURE385 = (ABS+REL 382) + pose(3) into dataset/normalize.")
     p.add_argument("--abs-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_bundle\ABS_input_vec_X2C_gpu.csv.gz"))
     p.add_argument("--rel-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_bundle\REL_input_vec_X2C_gpu.csv.gz"))
     p.add_argument("--target-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_bundle\metadata_normalize.jsonl"))
-    p.add_argument("--output-feature-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_compare3\FEATURE385_X2C_gpu.csv.gz"))
-    p.add_argument("--output-target-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_compare3\metadata_normalize.jsonl"))
-    p.add_argument("--output-columns-json", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_compare3\FEATURE385_X2C_gpu.csv.gz.columns.json"))
-    p.add_argument("--output-summary-json", type=Path, default=Path(r"D:\code\AU+landmark\dataset\x2c_data_compare3\FEATURE385_X2C_gpu.csv.gz.summary.json"))
+    p.add_argument("--output-feature-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\normalize\FEATURE385_X2C_gpu.csv.gz"))
+    p.add_argument("--output-target-file", type=Path, default=Path(r"D:\code\AU+landmark\dataset\normalize\metadata_normalize.jsonl"))
+    p.add_argument("--output-columns-json", type=Path, default=Path(r"D:\code\AU+landmark\dataset\normalize\FEATURE385_X2C_gpu.columns.json"))
+    p.add_argument("--output-summary-json", type=Path, default=Path(r"D:\code\AU+landmark\dataset\normalize\FEATURE385_X2C_gpu.summary.json"))
     return p.parse_args()
 
 
